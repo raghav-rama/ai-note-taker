@@ -1,0 +1,17 @@
+[package]
+name = "notetaker-linux"
+version = "0.1.0"
+edition = "2021"
+description = "Linux native GTK4 frontend for AI note taker"
+
+[[bin]]
+name = "dbus-monitor-session"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
+notetaker-core = { path = "../core" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+async-channel = "2"
+chrono = "0.4"

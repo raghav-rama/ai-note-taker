@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Application
+    x:Class="NoteHelper.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:NoteHelper">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
+
+            <!-- Brand colors -->
+            <Color x:Key="AppAccentColor">#0078D4</Color>
+            <SolidColorBrush x:Key="AppAccentBrush" Color="{StaticResource AppAccentColor}" />
+
+            <!-- Recording state colors -->
+            <Color x:Key="RecordingActiveColor">#E81123</Color>
+            <SolidColorBrush x:Key="RecordingActiveBrush" Color="{StaticResource RecordingActiveColor}" />
+            <Color x:Key="RecordingIdleColor">#107C10</Color>
+            <SolidColorBrush x:Key="RecordingIdleBrush" Color="{StaticResource RecordingIdleColor}" />
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

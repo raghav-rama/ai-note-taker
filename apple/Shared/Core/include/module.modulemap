@@ -1,0 +1,5 @@
+module NoteCore [system] {
+    header "notetaker.h"
+    link "notetaker"
+    export *
+}

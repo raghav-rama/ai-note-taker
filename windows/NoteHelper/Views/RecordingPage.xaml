@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="NoteHelper.Views.RecordingPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:NoteHelper.Views"
+    xmlns:muxc="using:Microsoft.UI.Xaml.Controls">
+
+    <Grid Padding="0" RowSpacing="16">
+        <Grid.RowDefinitions>
+            <!-- Header: title + timer -->
+            <RowDefinition Height="Auto"/>
+            <!-- Controls: record button + audio level -->
+            <RowDefinition Height="Auto"/>
+            <!-- Live transcript -->
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBox x:Name="MeetingTitleBox"
+                     Grid.Column="0"
+                     PlaceholderText="Meeting title..."
+                     Text="Untitled Meeting"
+                     FontSize="24"
+                     FontWeight="SemiBold"
+                     BorderThickness="0"
+                     Background="Transparent"
+                     Padding="0,4"/>
+
+            <StackPanel Grid.Column="1" Orientation="Horizontal"
+                        VerticalAlignment="Center" Spacing="8">
+                <TextBlock x:Name="TimerDisplay"
+                           Text="00:00:00"
+                           FontSize="28"
+                           FontFamily="Cascadia Mono, Consolas, monospace"
+                           FontWeight="Light"
+                           VerticalAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- Controls -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Record / Stop Button -->
+            <Button x:Name="RecordButton"
+                    Grid.Column="0"
+                    Click="RecordButton_Click"
+                    Width="140" Height="48"
+                    CornerRadius="24"
+                    Background="{StaticResource RecordingIdleBrush}"
+                    Foreground="White"
+                    HorizontalAlignment="Left">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <FontIcon x:Name="RecordButtonIcon" Glyph="&#xE7C8;" FontSize="18"/>
+                    <TextBlock x:Name="RecordButtonText" Text="Record"
+                               FontWeight="SemiBold" VerticalAlignment="Center"/>
+                </StackPanel>
+            </Button>
+
+            <!-- Pause Button (visible only while recording) -->
+            <Button x:Name="PauseButton"
+                    Grid.Column="1"
+                    Click="PauseButton_Click"
+                    Visibility="Collapsed"
+                    Width="48" Height="48"
+                    CornerRadius="24"
+                    Margin="8,0,0,0"
+                    ToolTipService.ToolTip="Pause">
+                <FontIcon Glyph="&#xE769;" FontSize="18"/>
+            </Button>
+
+            <!-- Audio Level Meter -->
+            <Grid Grid.Column="2" VerticalAlignment="Center" Margin="16,0,0,0">
+                <ProgressBar x:Name="AudioLevelBar"
+                             Minimum="0" Maximum="100" Value="0"
+                             Height="6"
+                             CornerRadius="3"
+                             IsIndeterminate="False"/>
+                <TextBlock x:Name="AudioLevelLabel"
+                           Text="Audio Level"
+                           FontSize="10"
+                           Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                           HorizontalAlignment="Right"
+                           Margin="0,-16,0,0"/>
+            </Grid>
+        </Grid>
+
+        <!-- Live Transcript -->
+        <Grid Grid.Row="2" CornerRadius="8"
+              Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+              BorderThickness="1"
+              Padding="16">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Text="Live Transcript"
+                       Style="{StaticResource SubtitleTextBlockStyle}"
+                       Margin="0,0,0,8"/>
+
+            <ScrollViewer x:Name="TranscriptScroller" Grid.Row="1"
+                          VerticalScrollBarVisibility="Auto">
+                <RichTextBlock x:Name="TranscriptBlock"
+                               FontSize="14"
+                               LineHeight="22"
+                               IsTextSelectionEnabled="True"
+                               TextWrapping="Wrap">
+                    <Paragraph>
+                        <Run x:Name="TranscriptPlaceholder"
+                             Text="Transcript will appear here when recording starts..."
+                             Foreground="{ThemeResource TextFillColorTertiaryBrush}"/>
+                    </Paragraph>
+                </RichTextBlock>
+            </ScrollViewer>
+        </Grid>
+    </Grid>
+</Page>

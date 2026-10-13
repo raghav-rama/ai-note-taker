@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="NoteHelper.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:NoteHelper"
+    xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
+    Title="System Helper">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <!-- Custom title bar area -->
+            <RowDefinition Height="48"/>
+            <!-- Navigation + Content -->
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Custom Title Bar -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Background="Transparent">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" Orientation="Horizontal"
+                        VerticalAlignment="Center" Margin="16,0,0,0">
+                <FontIcon Glyph="&#xE8BD;" FontSize="16" Margin="0,0,8,0"
+                          Foreground="{ThemeResource TextFillColorPrimaryBrush}"/>
+                <TextBlock Text="System Helper"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           VerticalAlignment="Center"/>
+            </StackPanel>
+
+            <!-- Recording indicator (visible when recording) -->
+            <StackPanel x:Name="RecordingIndicator" Grid.Column="2"
+                        Orientation="Horizontal" Margin="0,0,140,0"
+                        VerticalAlignment="Center" Visibility="Collapsed">
+                <Ellipse Width="8" Height="8"
+                         Fill="{StaticResource RecordingActiveBrush}" Margin="0,0,6,0"/>
+                <TextBlock x:Name="RecordingTimerText" Text="00:00"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Foreground="{StaticResource RecordingActiveBrush}"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- Navigation View -->
+        <muxc:NavigationView
+            x:Name="NavView"
+            Grid.Row="1"
+            IsBackButtonVisible="Collapsed"
+            IsSettingsVisible="True"
+            PaneDisplayMode="Left"
+            OpenPaneLength="200"
+            SelectionChanged="NavView_SelectionChanged"
+            Loaded="NavView_Loaded">
+
+            <muxc:NavigationView.MenuItems>
+                <muxc:NavigationViewItem Content="Recording" Tag="Recording">
+                    <muxc:NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE720;"/>
+                    </muxc:NavigationViewItem.Icon>
+                </muxc:NavigationViewItem>
+
+                <muxc:NavigationViewItem Content="History" Tag="History">
+                    <muxc:NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE81C;"/>
+                    </muxc:NavigationViewItem.Icon>
+                </muxc:NavigationViewItem>
+
+                <muxc:NavigationViewItem Content="Notes" Tag="Notes">
+                    <muxc:NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE70B;"/>
+                    </muxc:NavigationViewItem.Icon>
+                </muxc:NavigationViewItem>
+            </muxc:NavigationView.MenuItems>
+
+            <Frame x:Name="ContentFrame" Padding="24"/>
+
+        </muxc:NavigationView>
+    </Grid>
+</Window>

@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="NoteHelper.Views.HistoryPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:NoteHelper.Views"
+    xmlns:muxc="using:Microsoft.UI.Xaml.Controls">
+
+    <Grid RowSpacing="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <TextBlock Grid.Row="0" Text="Meeting History"
+                   Style="{StaticResource TitleTextBlockStyle}"/>
+
+        <!-- Search -->
+        <AutoSuggestBox x:Name="SearchBox"
+                        Grid.Row="1"
+                        PlaceholderText="Search meetings..."
+                        QueryIcon="Find"
+                        TextChanged="SearchBox_TextChanged"
+                        QuerySubmitted="SearchBox_QuerySubmitted"/>
+
+        <!-- Meeting List -->
+        <ListView x:Name="MeetingList"
+                  Grid.Row="2"
+                  SelectionMode="Single"
+                  SelectionChanged="MeetingList_SelectionChanged">
+
+            <ListView.ItemTemplate>
+                <DataTemplate x:DataType="local:MeetingItem">
+                    <Grid Padding="4,12" ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Date icon area -->
+                        <Grid Grid.Column="0" Width="48" Height="48"
+                              CornerRadius="8"
+                              Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                              HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+                                <TextBlock Text="{x:Bind DateMonth}"
+                                           FontSize="10"
+                                           HorizontalAlignment="Center"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                                <TextBlock Text="{x:Bind DateDay}"
+                                           FontSize="18" FontWeight="SemiBold"
+                                           HorizontalAlignment="Center"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- Title and time -->
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                            <TextBlock Text="{x:Bind Title}"
+                                       FontWeight="SemiBold"
+                                       TextTrimming="CharacterEllipsis"
+                                       MaxLines="1"/>
+                            <TextBlock Text="{x:Bind TimeRange}"
+                                       FontSize="12"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                        </StackPanel>
+
+                        <!-- Duration -->
+                        <TextBlock Grid.Column="2"
+                                   Text="{x:Bind DurationText}"
+                                   FontSize="12"
+                                   VerticalAlignment="Center"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+
+                        <!-- Context menu / actions -->
+                        <Button Grid.Column="3"
+                                Style="{StaticResource SubtleButtonStyle}"
+                                VerticalAlignment="Center"
+                                Padding="6">
+                            <FontIcon Glyph="&#xE712;" FontSize="14"/>
+                            <Button.Flyout>
+                                <MenuFlyout>
+                                    <MenuFlyoutItem Text="View Notes" Icon="Document"
+                                                    Click="ViewNotes_Click"/>
+                                    <MenuFlyoutItem Text="Export" Icon="Share"
+                                                    Click="Export_Click"/>
+                                    <MenuFlyoutSeparator/>
+                                    <MenuFlyoutItem Text="Delete" Icon="Delete"
+                                                    Click="Delete_Click"/>
+                                </MenuFlyout>
+                            </Button.Flyout>
+                        </Button>
+                    </Grid>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+
+            <!-- Empty state -->
+            <ListView.Header>
+                <StackPanel x:Name="EmptyState"
+                            Visibility="Visible"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Spacing="8"
+                            Padding="0,60,0,0">
+                    <FontIcon Glyph="&#xE81C;" FontSize="48"
+                              Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                              HorizontalAlignment="Center"/>
+                    <TextBlock Text="No meetings yet"
+                               Style="{StaticResource SubtitleTextBlockStyle}"
+                               HorizontalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                    <TextBlock Text="Start a recording to see meetings here."
+                               FontSize="14"
+                               HorizontalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"/>
+                </StackPanel>
+            </ListView.Header>
+        </ListView>
+    </Grid>
+</Page>
