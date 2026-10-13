@@ -3,28 +3,23 @@
 //! All core usage is confined to this module. Views only interact with
 //! [`CoreBridge`], keeping the coupling to a single file.
 
-use notetaker::audio::{self, AudioCapture};
+use notetaker::audio::{self, AudioCapture, AudioLevelCallback};
 use notetaker::models::{AudioDevice, Meeting, TranscriptSegment};
 use notetaker::storage::Database;
-use notetaker::transcribe::LocalTranscriber;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 
-/// Async-safe bridge around the notetaker-core modules.
-///
-/// Every method offloads blocking core calls onto the tokio thread pool via
-/// `spawn_blocking`, keeping the GTK main loop responsive.
 pub struct CoreBridge {
     db: Arc<Database>,
     model_path: String,
     capture: Arc<Mutex<Option<AudioCapture>>>,
     current_meeting_id: Arc<Mutex<Option<i64>>>,
     audio_level: Arc<Mutex<f32>>,
+    transcript_tx: Arc<Mutex<Option<async_channel::Sender<TranscriptSegment>>>>,
     rt: Handle,
 }
 
 impl CoreBridge {
-    /// Create a new bridge, initializing the underlying core.
     pub fn new(db_path: &str, model_path: &str, rt: Handle) -> Result<Self, String> {
         let db = Database::open(db_path).map_err(|e| e.to_string())?;
         Ok(Self {
@@ -33,39 +28,59 @@ impl CoreBridge {
             capture: Arc::new(Mutex::new(None)),
             current_meeting_id: Arc::new(Mutex::new(None)),
             audio_level: Arc::new(Mutex::new(0.0)),
+            transcript_tx: Arc::new(Mutex::new(None)),
             rt,
         })
     }
 
     // ── Recording ──────────────────────────────────────────────────────
 
-    pub async fn start_recording(&self, _device_id: Option<String>) -> Result<(), String> {
+    pub async fn start_recording(&self, device_id: Option<String>) -> Result<(), String> {
         let db = self.db.clone();
         let capture_slot = self.capture.clone();
         let meeting_slot = self.current_meeting_id.clone();
         let level = self.audio_level.clone();
-        let model_path = self.model_path.clone();
+        let transcript_tx = self.transcript_tx.clone();
+        let _model_path = self.model_path.clone();
 
         self.rt
             .spawn_blocking(move || {
-                // Create a new meeting in the database.
                 let meeting_id = db
                     .create_meeting("Untitled Meeting")
                     .map_err(|e| e.to_string())?;
                 *meeting_slot.lock().unwrap() = Some(meeting_id);
 
-                // Set up audio level callback.
+                // Audio level callback for UI metering.
                 let level_cb = level.clone();
-                let level_callback: Box<dyn Fn(f32) + Send + Sync> =
+                let level_callback: AudioLevelCallback =
                     Box::new(move |l| {
                         *level_cb.lock().unwrap() = l;
                     });
 
-                // Create audio capture — uses default device for now.
-                let cap = AudioCapture::new(level_callback)
+                // Channel for raw audio data from the capture thread.
+                let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+
+                let dev_id = device_id.as_deref();
+                let cap = AudioCapture::new(dev_id, audio_tx, Some(level_callback))
                     .map_err(|e| e.to_string())?;
                 cap.start().map_err(|e| e.to_string())?;
                 *capture_slot.lock().unwrap() = Some(cap);
+
+                // Spawn a thread that reads audio chunks and produces
+                // placeholder transcript segments. Real transcription would
+                // feed audio_rx into a Whisper model; for now we just drain
+                // the channel so the audio pipeline doesn't block.
+                let tx_slot = transcript_tx.lock().unwrap().clone();
+                let db_for_seg = db.clone();
+                std::thread::spawn(move || {
+                    let mut chunk_count: i64 = 0;
+                    while let Ok(_samples) = audio_rx.recv() {
+                        chunk_count += 1;
+                        // TODO: feed samples into LocalTranscriber and emit
+                        // real segments. For now the pipeline just drains.
+                        let _ = (&tx_slot, &db_for_seg, chunk_count);
+                    }
+                });
 
                 Ok(())
             })
@@ -80,12 +95,10 @@ impl CoreBridge {
 
         self.rt
             .spawn_blocking(move || {
-                // Stop audio capture.
                 if let Some(cap) = capture_slot.lock().unwrap().take() {
                     let _ = cap.stop();
                 }
 
-                // End the meeting.
                 let meeting_id = meeting_slot
                     .lock()
                     .unwrap()
@@ -113,16 +126,24 @@ impl CoreBridge {
             .map_err(|e| e.to_string())?
     }
 
-    /// Current audio input level (0.0 to 1.0). Called from UI timer, so
-    /// synchronous is fine — this is expected to be very fast.
     pub fn audio_level(&self) -> f32 {
         *self.audio_level.lock().unwrap()
+    }
+
+    /// Subscribe to incoming transcript segments.
+    ///
+    /// Returns an `async_channel::Receiver` that yields segments as they
+    /// arrive from the transcription pipeline. The recording view drains
+    /// this into its text buffer.
+    pub fn subscribe_transcripts(&self) -> async_channel::Receiver<TranscriptSegment> {
+        let (tx, rx) = async_channel::unbounded();
+        *self.transcript_tx.lock().unwrap() = Some(tx);
+        rx
     }
 
     // ── Meetings / Storage ─────────────────────────────────────────────
 
     pub async fn summarize(&self, meeting_id: i64) -> Result<String, String> {
-        // Summarization requires cloud feature — return a placeholder for now.
         let db = self.db.clone();
         self.rt
             .spawn_blocking(move || {
