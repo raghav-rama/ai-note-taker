@@ -164,8 +164,13 @@ build_ios() {
     local target="aarch64-apple-ios"
     ensure_target "$target"
 
-    # For iOS we need a static library
-    cargo build -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib
+    # Set minimum iOS deployment target to avoid version mismatch warnings
+    export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
+
+    # For iOS we need ONLY the static library — dylib linking fails on iOS.
+    # Use cargo rustc to pass --crate-type=staticlib directly.
+    cargo rustc -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib \
+        --crate-type staticlib
 
     local lib_path="$ROOT_DIR/target/$target/$(profile_dir)/lib${LIB_NAME}.a"
     if [[ ! -f "$lib_path" ]]; then
