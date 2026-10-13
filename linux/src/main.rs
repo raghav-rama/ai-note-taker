@@ -18,7 +18,7 @@ fn main() {
     let rt_handle = rt.handle().clone();
 
     // Determine paths for data and model storage.
-    let data_dir = glib::user_data_dir().join("session-monitor");
+    let data_dir = gtk::glib::user_data_dir().join("session-monitor");
     std::fs::create_dir_all(&data_dir).ok();
 
     let db_path = data_dir.join("data.db");
