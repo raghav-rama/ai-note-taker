@@ -24,7 +24,8 @@ pub use whisper_rs::WhisperContext;
 use crate::storage::Database;
 
 /// Sample rate of the audio fed to the transcriber (Whisper's native rate).
-pub const SAMPLE_RATE: usize = 16000;
+/// Private so cbindgen does not export it into the C header as a `#define`.
+const SAMPLE_RATE: usize = 16000;
 
 /// Target window size in samples (~4 seconds).
 const CHUNK_SIZE: usize = SAMPLE_RATE * 4;
