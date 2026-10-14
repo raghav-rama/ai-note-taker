@@ -1,6 +1,6 @@
 use adw::prelude::*;
 use gtk::{gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -134,6 +134,11 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     // ── State: current meeting ID ──────────────────────────────────────
 
     let current_meeting_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
+    // Monotonic token bumped on every `notes.load`. Async tasks capture it and
+    // bail if it advanced, so any later activation — even re-selecting the SAME
+    // meeting — invalidates an in-flight load or summary rather than letting a
+    // slow result overwrite the current view.
+    let load_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
     // "load" action — invoked from the History view when a meeting is selected.
     // It carries the meeting id as an int64 parameter, sets it as the current
@@ -141,6 +146,7 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     {
         let bridge_ref = bridge.clone();
         let meeting_id = current_meeting_id.clone();
+        let load_gen = load_gen.clone();
         let summary = summary_label.clone();
         let transcript = transcript_label.clone();
         let kp = key_points_label.clone();
@@ -153,6 +159,8 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
             let Some(mid) = param.and_then(|v| v.get::<i64>()) else {
                 return;
             };
+            let gen = load_gen.get().wrapping_add(1);
+            load_gen.set(gen);
             *meeting_id.borrow_mut() = Some(mid);
 
             // Clear sections parsed from any previously viewed meeting.
@@ -163,13 +171,13 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
             let bridge_c = bridge_ref.clone();
             let summary_c = summary.clone();
             let transcript_c = transcript.clone();
-            let meeting_id_c = meeting_id.clone();
+            let gen_c = load_gen.clone();
             glib::spawn_future_local(async move {
                 let meeting = bridge_c.get_meeting(mid).await;
-                // Discard this result if the user has since selected a different
-                // meeting: two rapid activations race, and an older fetch may
-                // finish last and otherwise clobber the newer selection.
-                if *meeting_id_c.borrow() != Some(mid) {
+                // Discard if a newer load activation has happened since (another
+                // meeting, or this same meeting re-selected), so a slow fetch
+                // can't clobber the current view.
+                if gen_c.get() != gen {
                     return;
                 }
                 match meeting {
@@ -184,7 +192,7 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                 }
 
                 let transcript = bridge_c.get_transcript(mid).await;
-                if *meeting_id_c.borrow() != Some(mid) {
+                if gen_c.get() != gen {
                     return;
                 }
                 match transcript {
@@ -210,6 +218,7 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     {
         let bridge_ref = bridge.clone();
         let meeting_id = current_meeting_id.clone();
+        let load_gen = load_gen.clone();
         let summary = summary_label.clone();
         let kp = key_points_label.clone();
         let ai = action_items_label.clone();
@@ -223,20 +232,22 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
             };
 
             btn.set_sensitive(false);
+            let gen = load_gen.get();
             let bridge_c = bridge_ref.clone();
             let summary_c = summary.clone();
             let kp_c = kp.clone();
             let ai_c = ai.clone();
             let dec_c = dec.clone();
             let btn_c = btn.clone();
-            let meeting_id_c = meeting_id.clone();
+            let gen_c = load_gen.clone();
 
             glib::spawn_future_local(async move {
                 let result = bridge_c.summarize(mid).await;
-                // Discard a summary for a meeting the user has since navigated
-                // away from, so it can't overwrite the now-current meeting's view
-                // (while Export would still operate on the newer selection).
-                if *meeting_id_c.borrow() != Some(mid) {
+                // Discard if any load activation happened after this summary was
+                // requested (another meeting, or this one re-selected), so it
+                // can't overwrite the now-current meeting's view while Export
+                // would operate on the newer selection.
+                if gen_c.get() != gen {
                     btn_c.set_sensitive(true);
                     return;
                 }

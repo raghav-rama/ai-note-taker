@@ -38,7 +38,7 @@ pub struct AudioCapture {
 }
 
 /// State for linear interpolation resampling.
-struct Resampler {
+pub struct Resampler {
     source_rate: u32,
     target_rate: u32,
     channels: u16,
@@ -49,7 +49,7 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn new(source_rate: u32, target_rate: u32, channels: u16) -> Self {
+    pub fn new(source_rate: u32, target_rate: u32, channels: u16) -> Self {
         Self {
             source_rate,
             target_rate,
@@ -60,7 +60,7 @@ impl Resampler {
     }
 
     /// Resample interleaved multi-channel input to mono 16kHz f32.
-    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
         // First downmix to mono by averaging channels.
         let mono: Vec<f32> = input
             .chunks(self.channels as usize)

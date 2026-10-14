@@ -8,27 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 
+use notetaker::audio::Resampler;
 use notetaker::storage::Database;
 use notetaker::transcribe::{LocalTranscriber, TranscriptCallback};
-
-/// Linear-interpolation resampler from `from_rate` to `to_rate` over mono samples.
-fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if input.is_empty() || from_rate == to_rate {
-        return input.to_vec();
-    }
-    let out_len = (input.len() as f64 * to_rate as f64 / from_rate as f64) as usize;
-    let mut out = Vec::with_capacity(out_len);
-    let last = input.len() - 1;
-    for i in 0..out_len {
-        let pos = i as f64 * from_rate as f64 / to_rate as f64;
-        let idx = (pos as usize).min(last);
-        let frac = (pos - idx as f64) as f32;
-        let s0 = input[idx];
-        let s1 = input[(idx + 1).min(last)];
-        out.push(s0 + (s1 - s0) * frac);
-    }
-    out
-}
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -42,7 +24,6 @@ fn main() -> anyhow::Result<()> {
     let mut reader = hound::WavReader::open(wav_path)
         .with_context(|| format!("Failed to open WAV file: {}", wav_path))?;
     let spec = reader.spec();
-    let channels = spec.channels.max(1) as usize;
 
     let interleaved: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
@@ -58,12 +39,11 @@ fn main() -> anyhow::Result<()> {
             .collect::<Result<Vec<f32>, _>>()?,
     };
 
-    let mono: Vec<f32> = interleaved
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect();
-
-    let samples = resample_linear(&mono, spec.sample_rate, 16000);
+    // Drive the SAME production downmix+resample the microphone pipeline uses
+    // (core::audio::Resampler), so this CI gate actually covers that path rather
+    // than a parallel copy. channels.max(1) guards against a malformed header.
+    let mut resampler = Resampler::new(spec.sample_rate, 16000, spec.channels.max(1));
+    let samples = resampler.process(&interleaved);
 
     // Throwaway database so the transcriber has somewhere to persist segments.
     let db_path = std::env::temp_dir().join(format!("transcribe_wav_{}.db", std::process::id()));
