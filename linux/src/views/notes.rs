@@ -163,8 +163,16 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
             let bridge_c = bridge_ref.clone();
             let summary_c = summary.clone();
             let transcript_c = transcript.clone();
+            let meeting_id_c = meeting_id.clone();
             glib::spawn_future_local(async move {
-                match bridge_c.get_meeting(mid).await {
+                let meeting = bridge_c.get_meeting(mid).await;
+                // Discard this result if the user has since selected a different
+                // meeting: two rapid activations race, and an older fetch may
+                // finish last and otherwise clobber the newer selection.
+                if *meeting_id_c.borrow() != Some(mid) {
+                    return;
+                }
+                match meeting {
                     Ok(meeting) => {
                         summary_c.set_label(&format!(
                             "{}\n\nPress \u{201c}Generate Summary\u{201d} to create notes.",
@@ -175,7 +183,11 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                     Err(e) => summary_c.set_label(&format!("Failed to load meeting: {e}")),
                 }
 
-                match bridge_c.get_transcript(mid).await {
+                let transcript = bridge_c.get_transcript(mid).await;
+                if *meeting_id_c.borrow() != Some(mid) {
+                    return;
+                }
+                match transcript {
                     Ok(segments) => {
                         let text = segments
                             .iter()

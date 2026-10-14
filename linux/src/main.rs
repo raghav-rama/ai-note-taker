@@ -23,12 +23,13 @@ fn main() {
 
     let db_path = data_dir.join("data.db");
 
-    // Whisper models: prefer whichever location already holds a ggml-*.bin
-    // model. The downloadable artifact bundles the model under ./models next to
-    // the binary; otherwise models live under the XDG data dir
-    // (~/.local/share/session-monitor/models), where the in-app downloader
-    // writes them. Only when neither has a model yet do we create a directory
-    // (XDG first, then ./models) for a future download.
+    // Whisper models: prefer whichever known location already holds a ggml-*.bin
+    // model, checked in order:
+    //   1. next to the executable  — packaged/downloadable artifact
+    //   2. ./models in the CWD      — source build (scripts/download-model.sh)
+    //   3. the XDG data dir         — written by the in-app downloader
+    // Only when none has a model do we create a directory (XDG, else exe-dir,
+    // else CWD) for a future download.
     let model_path = {
         let has_model = |dir: &std::path::Path| -> bool {
             std::fs::read_dir(dir)
@@ -41,24 +42,32 @@ fn main() {
                 })
                 .unwrap_or(false)
         };
-        // Resolve the bundled "models" dir next to the executable (not the
-        // process CWD), so launching from another directory or a desktop
-        // launcher still finds the model shipped in the artifact.
-        let local = std::env::current_exe()
+        let exe_models = std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("models");
+            .and_then(|p| p.parent().map(|d| d.join("models")));
+        let cwd_models = std::path::PathBuf::from("models");
         let xdg_models = data_dir.join("models");
-        if has_model(&local) {
-            local
-        } else if has_model(&xdg_models) {
-            xdg_models
-        } else if std::fs::create_dir_all(&xdg_models).is_ok() {
-            xdg_models
-        } else {
-            std::fs::create_dir_all(&local).ok();
-            local
+
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(ref d) = exe_models {
+            candidates.push(d.clone());
+        }
+        candidates.push(cwd_models.clone());
+        candidates.push(xdg_models.clone());
+
+        match candidates.into_iter().find(|d| has_model(d)) {
+            Some(dir) => dir,
+            None => {
+                if std::fs::create_dir_all(&xdg_models).is_ok() {
+                    xdg_models
+                } else if let Some(exe_dir) = exe_models {
+                    std::fs::create_dir_all(&exe_dir).ok();
+                    exe_dir
+                } else {
+                    std::fs::create_dir_all(&cwd_models).ok();
+                    cwd_models
+                }
+            }
         }
     };
 
