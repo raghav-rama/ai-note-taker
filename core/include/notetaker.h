@@ -37,7 +37,8 @@ typedef struct NoteHandle NoteHandle;
 // Initialize the notetaker engine.
 //
 // - `db_path`: path to the SQLite database file (created if absent).
-// - `model_path`: path to the Whisper GGML model file.
+// - `model_path`: path to the directory containing Whisper GGML model files
+//   (the specific model is selected per recording via the `whisper_model` setting).
 //
 // Returns an opaque `NoteHandle*` on success, or null on failure.
 struct NoteHandle *note_init(const char *db_path, const char *model_path);
@@ -66,6 +67,12 @@ int32_t note_stop_recording(struct NoteHandle *handle);
 // Audio capture is paused but the meeting remains active.
 // Returns 0 on success, or a negative error code.
 int32_t note_pause_recording(struct NoteHandle *handle);
+
+// Get the most recent RMS audio input level (0.0 to 1.0).
+//
+// Returns the level for UI metering, or 0.0 if the handle is null or no
+// recording is active.
+float note_get_audio_level(struct NoteHandle *handle);
 
 // Set the callback invoked for each new transcript segment.
 //

@@ -36,11 +36,12 @@ build-core:
 .PHONY: build-macos
 build-macos:
 ifeq ($(UNAME_S),Darwin)
-	# Build core for both Apple Silicon and Intel
+	# Build core for both Apple Silicon and Intel (--lib: skip the transcribe-wav
+	# bin, which is host-only and shouldn't be cross-compiled/linked here)
 	$(CARGO) build --manifest-path core/Cargo.toml $(CARGO_FLAGS) \
-		--target aarch64-apple-darwin --features metal
+		--lib --target aarch64-apple-darwin --features metal
 	$(CARGO) build --manifest-path core/Cargo.toml $(CARGO_FLAGS) \
-		--target x86_64-apple-darwin
+		--lib --target x86_64-apple-darwin
 	# Create universal binary
 	mkdir -p core/target/universal/$(PROFILE)
 	lipo -create \
@@ -63,11 +64,12 @@ endif
 .PHONY: build-ios
 build-ios:
 ifeq ($(UNAME_S),Darwin)
-	# Build core for iOS device and simulator
+	# Build core for iOS device and simulator (--lib only: iOS targets produce a
+	# static library, never the transcribe-wav executable)
 	$(CARGO) build --manifest-path core/Cargo.toml $(CARGO_FLAGS) \
-		--target aarch64-apple-ios --features metal
+		--lib --target aarch64-apple-ios --features metal
 	$(CARGO) build --manifest-path core/Cargo.toml $(CARGO_FLAGS) \
-		--target aarch64-apple-ios-sim --features metal
+		--lib --target aarch64-apple-ios-sim --features metal
 	# Create XCFramework
 	xcodebuild -create-xcframework \
 		-library core/target/aarch64-apple-ios/$(PROFILE)/libnotetaker.a \
@@ -90,7 +92,7 @@ endif
 .PHONY: build-windows
 build-windows:
 	$(CARGO) build --manifest-path core/Cargo.toml $(CARGO_FLAGS) \
-		--target x86_64-pc-windows-msvc
+		--lib --target x86_64-pc-windows-msvc
 	dotnet build windows/NoteHelper/NoteHelper.sln -c Release
 
 # ─── Linux ───────────────────────────────────────────────────────────────────
@@ -114,7 +116,7 @@ build-android:
 		--target x86_64-linux-android \
 		--target i686-linux-android \
 		--platform 26 \
-		-- build $(CARGO_FLAGS)
+		-- build $(CARGO_FLAGS) --lib
 	# Build Android app
 	cd android && ./gradlew assembleRelease
 
