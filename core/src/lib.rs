@@ -1084,7 +1084,13 @@ pub extern "C" fn note_last_error() -> *mut c_char {
 /// already installed (for example by the host app), the callback is stored but
 /// will not receive records.
 #[no_mangle]
-pub extern "C" fn note_set_log_callback(cb: Option<LogCallbackFn>, ctx: *mut c_void) {
+pub extern "C" fn note_set_log_callback(
+    // The function-pointer type is spelled inline (not via the `LogCallbackFn`
+    // alias) so cbindgen renders it as a nullable C function pointer rather than
+    // emitting an opaque `struct Option_LogCallbackFn`.
+    cb: Option<unsafe extern "C" fn(i32, *const c_char, *mut c_void)>,
+    ctx: *mut c_void,
+) {
     let _ = catch_unwind(|| {
         LOGGER_INIT.get_or_init(|| match log::set_logger(&LOGGER) {
             Ok(()) => {
