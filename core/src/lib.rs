@@ -98,6 +98,119 @@ fn string_to_cptr(s: String) -> *mut c_char {
     }
 }
 
+// ── Error reporting ──────────────────────────────────────────────────
+
+use std::cell::RefCell;
+use std::sync::OnceLock;
+
+thread_local! {
+    /// The most recent error message produced on this thread, retrievable via
+    /// [`note_last_error`]. FFI entry points run on the caller's thread, so the
+    /// synchronous failures a consumer cares about (missing model, no microphone,
+    /// locked database, no API key, `note_init` returning null) land here.
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+/// Record `msg` as this thread's last error. Interior NUL bytes are replaced so
+/// the conversion never fails.
+fn set_last_error(msg: impl Into<String>) {
+    let cleaned = msg.into().replace('\0', " ");
+    let cs = CString::new(cleaned).unwrap_or_default();
+    LAST_ERROR.with(|e| *e.borrow_mut() = Some(cs));
+}
+
+/// C function pointer type for the structured log callback.
+/// Parameters: level (1=error, 2=warn, 3=info, 4=debug, 5=trace), message, ctx.
+type LogCallbackFn = unsafe extern "C" fn(i32, *const c_char, *mut c_void);
+
+/// Registered C log sink. `Send`/`Sync` because the caller guarantees the
+/// context pointer outlives the callback and is safe to use from any thread.
+struct CLogCallback {
+    cb: LogCallbackFn,
+    ctx: CallbackCtx,
+}
+unsafe impl Send for CLogCallback {}
+unsafe impl Sync for CLogCallback {}
+
+static LOG_SINK: Mutex<Option<CLogCallback>> = Mutex::new(None);
+static LOGGER_INIT: OnceLock<bool> = OnceLock::new();
+
+/// A `log::Log` implementation that forwards records to the registered C sink.
+struct CLogger;
+
+impl log::Log for CLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        let Ok(guard) = LOG_SINK.lock() else { return };
+        let Some(ref sink) = *guard else { return };
+        let level = match record.level() {
+            log::Level::Error => 1,
+            log::Level::Warn => 2,
+            log::Level::Info => 3,
+            log::Level::Debug => 4,
+            log::Level::Trace => 5,
+        };
+        if let Ok(cs) = CString::new(format!("{}", record.args()).replace('\0', " ")) {
+            unsafe {
+                (sink.cb)(level, cs.as_ptr(), sink.ctx.ptr());
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: CLogger = CLogger;
+
+/// Return the most recent error message for the calling thread, or null if none.
+///
+/// The returned string is caller-owned; free it with [`note_free_string`].
+/// Call this after an FFI function reports failure (a negative code or a null
+/// return) to get a human-readable reason.
+#[no_mangle]
+pub extern "C" fn note_last_error() -> *mut c_char {
+    catch_unwind(|| {
+        LAST_ERROR.with(|e| match e.borrow().as_ref() {
+            Some(cs) => cs.clone().into_raw(),
+            None => std::ptr::null_mut(),
+        })
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Install a structured log callback.
+///
+/// - `cb`: `void(int level, const char* message, void* ctx)` invoked for each log
+///   record, or null to detach the current sink. The message pointer is only
+///   valid for the duration of the call. Levels: 1=error, 2=warn, 3=info,
+///   4=debug, 5=trace.
+/// - `ctx`: opaque context pointer passed through to the callback.
+///
+/// The underlying logger is installed once per process; if another logger was
+/// already installed (for example by the host app), the callback is stored but
+/// will not receive records.
+#[no_mangle]
+pub extern "C" fn note_set_log_callback(cb: Option<LogCallbackFn>, ctx: *mut c_void) {
+    let _ = catch_unwind(|| {
+        LOGGER_INIT.get_or_init(|| match log::set_logger(&LOGGER) {
+            Ok(()) => {
+                log::set_max_level(log::LevelFilter::Info);
+                true
+            }
+            Err(_) => false,
+        });
+        if let Ok(mut guard) = LOG_SINK.lock() {
+            *guard = cb.map(|f| CLogCallback {
+                cb: f,
+                ctx: CallbackCtx(ctx),
+            });
+        }
+    });
+}
+
 // ── Lifecycle ────────────────────────────────────────────────────────
 
 /// Initialize the notetaker engine.
@@ -113,6 +226,7 @@ pub extern "C" fn note_init(db_path: *const c_char, model_path: *const c_char) -
         let db_path = match unsafe { cstr_to_str(db_path) } {
             Some(s) => s,
             None => {
+                set_last_error("note_init: db_path is null or invalid UTF-8");
                 error!("note_init: db_path is null or invalid UTF-8");
                 return std::ptr::null_mut();
             }
@@ -120,6 +234,7 @@ pub extern "C" fn note_init(db_path: *const c_char, model_path: *const c_char) -
         let model_path = match unsafe { cstr_to_str(model_path) } {
             Some(s) => s,
             None => {
+                set_last_error("note_init: model_path is null or invalid UTF-8");
                 error!("note_init: model_path is null or invalid UTF-8");
                 return std::ptr::null_mut();
             }
@@ -128,6 +243,7 @@ pub extern "C" fn note_init(db_path: *const c_char, model_path: *const c_char) -
         let db = match Database::open(db_path) {
             Ok(db) => Arc::new(db),
             Err(e) => {
+                set_last_error(format!("note_init: failed to open database: {}", e));
                 error!("note_init: failed to open database: {}", e);
                 return std::ptr::null_mut();
             }
@@ -136,6 +252,7 @@ pub extern "C" fn note_init(db_path: *const c_char, model_path: *const c_char) -
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
+                set_last_error(format!("note_init: failed to create tokio runtime: {}", e));
                 error!("note_init: failed to create tokio runtime: {}", e);
                 return std::ptr::null_mut();
             }
@@ -201,6 +318,7 @@ pub extern "C" fn note_start_recording(
 
         // Guard against starting a new recording while one is active.
         if h.current_meeting_id.lock().unwrap().is_some() {
+            set_last_error("Cannot start recording: a recording session is already active");
             error!("Cannot start recording: a recording session is already active");
             return NOTE_ERR_INTERNAL;
         }
@@ -209,6 +327,7 @@ pub extern "C" fn note_start_recording(
         let meeting_id = match h.db.create_meeting("Untitled Meeting") {
             Ok(id) => id,
             Err(e) => {
+                set_last_error(format!("Failed to create meeting: {}", e));
                 error!("Failed to create meeting: {}", e);
                 return NOTE_ERR_INTERNAL;
             }
@@ -238,6 +357,7 @@ pub extern "C" fn note_start_recording(
         let capture = match AudioCapture::new(device, audio_tx, Some(level_cb)) {
             Ok(c) => c,
             Err(e) => {
+                set_last_error(format!("Failed to create audio capture: {}", e));
                 error!("Failed to create audio capture: {}", e);
                 cleanup();
                 return NOTE_ERR_INTERNAL;
@@ -304,6 +424,7 @@ pub extern "C" fn note_start_recording(
         ) {
             Ok(t) => t,
             Err(e) => {
+                set_last_error(format!("Failed to start transcriber: {}", e));
                 error!("Failed to start transcriber: {}", e);
                 cleanup();
                 return NOTE_ERR_INTERNAL;
@@ -312,6 +433,7 @@ pub extern "C" fn note_start_recording(
 
         // Start audio capture.
         if let Err(e) = capture.start() {
+            set_last_error(format!("Failed to start audio: {}", e));
             error!("Failed to start audio: {}", e);
             cleanup();
             return NOTE_ERR_INTERNAL;
@@ -466,12 +588,17 @@ pub extern "C" fn note_summarize(handle: *mut NoteHandle, meeting_id: i64) -> *m
         let segments = match h.db.get_segments(meeting_id) {
             Ok(s) => s,
             Err(e) => {
+                set_last_error(format!(
+                    "Failed to get segments for meeting {}: {}",
+                    meeting_id, e
+                ));
                 error!("Failed to get segments for meeting {}: {}", meeting_id, e);
                 return std::ptr::null_mut();
             }
         };
 
         if segments.is_empty() {
+            set_last_error(format!("No transcript segments for meeting {}", meeting_id));
             error!("No transcript segments for meeting {}", meeting_id);
             return std::ptr::null_mut();
         }
@@ -488,8 +615,9 @@ pub extern "C" fn note_summarize(handle: *mut NoteHandle, meeting_id: i64) -> *m
         #[cfg(feature = "cloud")]
         {
             let api_key = match h.db.get_setting("anthropic_api_key") {
-                Ok(Some(key)) => key,
+                Ok(Some(key)) if !key.trim().is_empty() => key,
                 _ => {
+                    set_last_error("No API key configured (set 'anthropic_api_key' setting)");
                     error!("No API key configured (set 'anthropic_api_key' setting)");
                     return std::ptr::null_mut();
                 }
@@ -521,6 +649,7 @@ pub extern "C" fn note_summarize(handle: *mut NoteHandle, meeting_id: i64) -> *m
                     return string_to_cptr(json);
                 }
                 Err(e) => {
+                    set_last_error(format!("Summarization failed: {}", e));
                     error!("Summarization failed: {}", e);
                     return std::ptr::null_mut();
                 }
@@ -529,6 +658,7 @@ pub extern "C" fn note_summarize(handle: *mut NoteHandle, meeting_id: i64) -> *m
 
         #[cfg(not(feature = "cloud"))]
         {
+            set_last_error("Summarization requires the 'cloud' feature");
             error!("Summarization requires the 'cloud' feature");
             std::ptr::null_mut()
         }
