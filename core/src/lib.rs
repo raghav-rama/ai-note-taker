@@ -31,7 +31,7 @@ use crate::audio::AudioCapture;
 use crate::storage::Database;
 #[cfg(feature = "cloud")]
 use crate::summarize::Summarizer;
-use crate::transcribe::{self, LocalTranscriber, TranscriberConfig};
+use crate::transcribe::{LocalTranscriber, TranscriberConfig};
 
 // ── Error codes ──────────────────────────────────────────────────────
 
