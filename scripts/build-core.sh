@@ -105,6 +105,18 @@ build_profile_flag() {
     fi
 }
 
+# Extra cargo features to enable for the core library, from the CORE_FEATURES env
+# var (space- or comma-separated). Empty by default. Note: enabling `cloud` pulls
+# in reqwest/rustls (ring), which does not cross-compile cleanly to every Android
+# ABI — leave CORE_FEATURES unset for Android targets.
+features_flag() {
+    if [[ -n "${CORE_FEATURES:-}" ]]; then
+        echo "--features ${CORE_FEATURES}"
+    else
+        echo ""
+    fi
+}
+
 profile_dir() {
     if [[ "$PROFILE" == "release" ]]; then
         echo "release"
@@ -131,7 +143,7 @@ build_macos() {
     for target in "${targets[@]}"; do
         ensure_target "$target"
         log_info "  Building for $target..."
-        cargo build -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib
+        cargo build -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib $(features_flag)
         local lib_path="$ROOT_DIR/target/$target/$(profile_dir)/lib${LIB_NAME}.dylib"
         if [[ ! -f "$lib_path" ]]; then
             log_error "Expected library not found: $lib_path"
@@ -169,7 +181,7 @@ build_ios() {
 
     # For iOS we need ONLY the static library — dylib linking fails on iOS.
     # Use cargo rustc to pass --crate-type=staticlib directly.
-    cargo rustc -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib \
+    cargo rustc -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib $(features_flag) \
         --crate-type staticlib
 
     local lib_path="$ROOT_DIR/target/$target/$(profile_dir)/lib${LIB_NAME}.a"
@@ -198,7 +210,7 @@ build_windows() {
     local target="x86_64-pc-windows-msvc"
     ensure_target "$target"
 
-    cargo build -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib
+    cargo build -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib $(features_flag)
 
     local dll_path="$ROOT_DIR/target/$target/$(profile_dir)/${LIB_NAME}.dll"
     local lib_path="$ROOT_DIR/target/$target/$(profile_dir)/${LIB_NAME}.dll.lib"
@@ -232,7 +244,7 @@ build_linux() {
     local target="x86_64-unknown-linux-gnu"
     ensure_target "$target"
 
-    $(cargo_cmd) build -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib
+    $(cargo_cmd) build -p "$CRATE_NAME" --target "$target" $(build_profile_flag) --lib $(features_flag)
 
     local lib_path="$ROOT_DIR/target/$target/$(profile_dir)/lib${LIB_NAME}.so"
     if [[ ! -f "$lib_path" ]]; then
@@ -280,6 +292,9 @@ build_android() {
     # [[bin]] (transcribe-wav), and without --lib cargo-ndk would cross-compile
     # that executable for the Android targets, linking whisper.cpp's C++ into an
     # executable (not the cdylib) and failing libc++ symbol resolution.
+    #
+    # CORE_FEATURES is intentionally NOT applied to Android: `cloud` pulls in
+    # reqwest/rustls (ring), which does not cross-compile cleanly to every ABI.
     cargo ndk \
         -t arm64-v8a \
         -t armeabi-v7a \

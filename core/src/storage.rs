@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
-use crate::models::{Meeting, Note, TranscriptSegment};
+use crate::models::{Meeting, Note, Summary, TranscriptSegment};
 
 /// Thread-safe wrapper around a rusqlite `Connection`.
 ///
@@ -17,6 +17,84 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+/// Ordered schema migrations. The database's `PRAGMA user_version` records how
+/// many of these have been applied; [`Database::open`] runs any that are pending.
+///
+/// **Append-only.** Never edit or reorder an existing entry — a shipped database
+/// has already applied it and will not re-run it. Add new schema changes as new
+/// array elements. Each migration must be safe to apply to a database that a
+/// previous app version created (hence `IF NOT EXISTS` on migration 1, which also
+/// upgrades Phase-1 databases that have the tables but `user_version = 0`).
+const MIGRATIONS: &[&str] = &[
+    // ── Migration 1: initial schema ──────────────────────────────────────
+    "
+    CREATE TABLE IF NOT EXISTS meetings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL DEFAULT 'Untitled Meeting',
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        duration_secs INTEGER,
+        summary TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS transcript_segments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        meeting_id INTEGER NOT NULL REFERENCES meetings(id),
+        timestamp_ms INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        confidence REAL
+    );
+
+    CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        meeting_id INTEGER NOT NULL REFERENCES meetings(id),
+        content TEXT NOT NULL,
+        note_type TEXT NOT NULL DEFAULT 'summary',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    -- FTS5 virtual table for full-text search over transcript segments.
+    CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
+        text,
+        content='transcript_segments',
+        content_rowid='id'
+    );
+
+    -- Triggers to keep the FTS index in sync.
+    CREATE TRIGGER IF NOT EXISTS transcript_fts_ai AFTER INSERT ON transcript_segments BEGIN
+        INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS transcript_fts_ad AFTER DELETE ON transcript_segments BEGIN
+        INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.id, old.text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS transcript_fts_au AFTER UPDATE ON transcript_segments BEGIN
+        INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.id, old.text);
+        INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+    ",
+    // ── Migration 2: structured AI summaries ─────────────────────────────
+    // One row per meeting. The narrative lives in `summary`; the three lists are
+    // stored as JSON arrays so the structured shape survives without widening the
+    // `meetings` row (which is the JSON contract the native apps decode).
+    "
+    CREATE TABLE IF NOT EXISTS meeting_summaries (
+        meeting_id   INTEGER PRIMARY KEY REFERENCES meetings(id),
+        summary      TEXT NOT NULL,
+        key_points   TEXT NOT NULL DEFAULT '[]',
+        action_items TEXT NOT NULL DEFAULT '[]',
+        decisions    TEXT NOT NULL DEFAULT '[]'
+    );
+    ",
+];
+
 impl Database {
     /// Open (or create) a database at the given path and apply migrations.
     pub fn open(path: &str) -> Result<Self> {
@@ -24,74 +102,44 @@ impl Database {
             .with_context(|| format!("Failed to open database at {}", path))?;
 
         // Enable WAL mode for better concurrent read performance.
+        // (On `:memory:` databases this is a no-op and journal_mode stays
+        // "memory"; execute_batch ignores the returned row either way.)
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         let db = Self {
             conn: Mutex::new(conn),
         };
-        db.create_schema()?;
+        db.run_migrations()?;
         Ok(db)
     }
 
-    /// Create all tables if they do not already exist.
-    fn create_schema(&self) -> Result<()> {
+    /// Return the current schema version (`PRAGMA user_version`).
+    pub fn schema_version(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS meetings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL DEFAULT 'Untitled Meeting',
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                duration_secs INTEGER,
-                summary TEXT
-            );
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(v)
+    }
 
-            CREATE TABLE IF NOT EXISTS transcript_segments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                meeting_id INTEGER NOT NULL REFERENCES meetings(id),
-                timestamp_ms INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                confidence REAL
-            );
+    /// Apply any migrations the database has not yet seen, advancing
+    /// `user_version` after each. Each migration runs in its own transaction so a
+    /// failure leaves the version pointing at the last fully-applied migration.
+    fn run_migrations(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut current: usize = conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?
+            .max(0) as usize;
 
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                meeting_id INTEGER NOT NULL REFERENCES meetings(id),
-                content TEXT NOT NULL,
-                note_type TEXT NOT NULL DEFAULT 'summary',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            -- FTS5 virtual table for full-text search over transcript segments.
-            CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
-                text,
-                content='transcript_segments',
-                content_rowid='id'
-            );
-
-            -- Triggers to keep the FTS index in sync.
-            CREATE TRIGGER IF NOT EXISTS transcript_fts_ai AFTER INSERT ON transcript_segments BEGIN
-                INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS transcript_fts_ad AFTER DELETE ON transcript_segments BEGIN
-                INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.id, old.text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS transcript_fts_au AFTER UPDATE ON transcript_segments BEGIN
-                INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.id, old.text);
-                INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
-            END;
-            ",
-        )?;
+        while current < MIGRATIONS.len() {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(MIGRATIONS[current])
+                .with_context(|| format!("Failed to apply migration {}", current + 1))?;
+            // `user_version` takes an integer literal (it cannot be parameterized);
+            // the value is an internal counter, never user input, so this is safe.
+            tx.execute_batch(&format!("PRAGMA user_version = {};", current + 1))?;
+            tx.commit()?;
+            current += 1;
+        }
         Ok(())
     }
 
@@ -126,6 +174,16 @@ impl Database {
         conn.execute(
             "UPDATE meetings SET summary = ?1 WHERE id = ?2",
             params![summary, meeting_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update the title for a meeting.
+    pub fn update_meeting_title(&self, meeting_id: i64, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE meetings SET title = ?1 WHERE id = ?2",
+            params![title, meeting_id],
         )?;
         Ok(())
     }
@@ -190,9 +248,75 @@ impl Database {
             "DELETE FROM transcript_segments WHERE meeting_id = ?1",
             params![meeting_id],
         )?;
+        // meeting_summaries has a foreign key to meetings(id) (and foreign_keys is
+        // ON), so its row must be removed before the parent meeting.
+        tx.execute(
+            "DELETE FROM meeting_summaries WHERE meeting_id = ?1",
+            params![meeting_id],
+        )?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ── Summaries ─────────────────────────────────────────────────────
+
+    /// Insert or replace the structured AI summary for a meeting. The three lists
+    /// are stored as JSON arrays in the `meeting_summaries` table.
+    pub fn upsert_summary(&self, meeting_id: i64, summary: &Summary) -> Result<()> {
+        let key_points = serde_json::to_string(&summary.key_points)?;
+        let action_items = serde_json::to_string(&summary.action_items)?;
+        let decisions = serde_json::to_string(&summary.decisions)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meeting_summaries
+                (meeting_id, summary, key_points, action_items, decisions)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(meeting_id) DO UPDATE SET
+                summary = excluded.summary,
+                key_points = excluded.key_points,
+                action_items = excluded.action_items,
+                decisions = excluded.decisions",
+            params![
+                meeting_id,
+                summary.summary,
+                key_points,
+                action_items,
+                decisions
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the structured AI summary for a meeting, if one has been generated.
+    pub fn get_summary(&self, meeting_id: i64) -> Result<Option<Summary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT summary, key_points, action_items, decisions
+             FROM meeting_summaries WHERE meeting_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![meeting_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(row) => {
+                let (summary, key_points, action_items, decisions) = row?;
+                Ok(Some(Summary {
+                    summary,
+                    // Lists are stored as JSON arrays; fall back to empty on any
+                    // legacy/corrupt value rather than failing the read.
+                    key_points: serde_json::from_str(&key_points).unwrap_or_default(),
+                    action_items: serde_json::from_str(&action_items).unwrap_or_default(),
+                    decisions: serde_json::from_str(&decisions).unwrap_or_default(),
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     // ── Transcript Segments ───────────────────────────────────────────
@@ -301,6 +425,20 @@ impl Database {
             ids.push(row?);
         }
         Ok(ids)
+    }
+
+    /// Search meetings by transcript text and return the full [`Meeting`] rows,
+    /// newest first. This is what the FFI search surface returns so callers get
+    /// decodable meeting objects rather than bare ids.
+    pub fn search_meetings_full(&self, query: &str) -> Result<Vec<Meeting>> {
+        let ids = self.search_meetings(query)?;
+        let mut meetings = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(m) = self.get_meeting(id)? {
+                meetings.push(m);
+            }
+        }
+        Ok(meetings)
     }
 
     // ── Settings ──────────────────────────────────────────────────────
