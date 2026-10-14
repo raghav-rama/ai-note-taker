@@ -248,6 +248,12 @@ impl Database {
             "DELETE FROM transcript_segments WHERE meeting_id = ?1",
             params![meeting_id],
         )?;
+        // meeting_summaries has a foreign key to meetings(id) (and foreign_keys is
+        // ON), so its row must be removed before the parent meeting.
+        tx.execute(
+            "DELETE FROM meeting_summaries WHERE meeting_id = ?1",
+            params![meeting_id],
+        )?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id])?;
         tx.commit()?;
         Ok(())

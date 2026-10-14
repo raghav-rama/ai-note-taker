@@ -126,6 +126,30 @@ fn delete_meeting_cascades_including_fts() {
 }
 
 #[test]
+fn delete_meeting_with_summary_succeeds() {
+    // Regression: meeting_summaries has a FK to meetings(id) with foreign_keys
+    // ON, so deleting a meeting that has a stored summary must remove the summary
+    // row first or the delete fails with a FK violation.
+    let db = mem();
+    let id = db.create_meeting("summarized").unwrap();
+    db.insert_segment(id, 0, "some content", None).unwrap();
+    db.upsert_summary(
+        id,
+        &Summary {
+            summary: "s".into(),
+            key_points: vec!["k".into()],
+            action_items: vec![],
+            decisions: vec![],
+        },
+    )
+    .unwrap();
+
+    db.delete_meeting(id).expect("delete of summarized meeting must succeed");
+    assert!(db.get_meeting(id).unwrap().is_none());
+    assert!(db.get_summary(id).unwrap().is_none());
+}
+
+#[test]
 fn summary_upsert_and_get() {
     let db = mem();
     let id = db.create_meeting("m").unwrap();

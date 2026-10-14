@@ -157,6 +157,31 @@ fn failed_start_reports_error_and_leaves_no_orphan_meeting() {
 }
 
 #[test]
+fn last_error_is_cleared_by_a_later_call() {
+    // A failed init sets a thread-local error message.
+    let model = CString::new("/x").unwrap();
+    let h0 = note_init(std::ptr::null(), model.as_ptr());
+    assert!(h0.is_null());
+    let err = note_last_error();
+    assert!(!err.is_null());
+    note_free_string(err);
+
+    // A later successful call clears it, so a subsequent legitimate not-found
+    // (which returns null without setting an error) does not surface the stale
+    // message — no phantom error.
+    let db = tmp_db();
+    let model2 = CString::new("/nonexistent/models").unwrap();
+    let h = note_init(db.as_ptr(), model2.as_ptr());
+    assert!(!h.is_null());
+    assert!(note_get_meeting(h, 123_456).is_null());
+    assert!(
+        note_last_error().is_null(),
+        "stale error leaked after a not-found lookup"
+    );
+    note_destroy(h);
+}
+
+#[test]
 fn log_callback_install_and_detach_is_safe() {
     extern "C" fn sink(_level: i32, _msg: *const c_char, _ctx: *mut c_void) {}
     note_set_log_callback(Some(sink), std::ptr::null_mut());

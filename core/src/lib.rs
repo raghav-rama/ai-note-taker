@@ -119,6 +119,14 @@ fn set_last_error(msg: impl Into<String>) {
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(cs));
 }
 
+/// Clear this thread's last error. Called at the start of each fallible FFI entry
+/// point so `note_last_error` reflects only the most recent call and never returns
+/// a stale message from an earlier, unrelated one (for example after a legitimate
+/// not-found that returns null without setting an error).
+fn clear_last_error() {
+    LAST_ERROR.with(|e| *e.borrow_mut() = None);
+}
+
 /// C function pointer type for the structured log callback.
 /// Parameters: level (1=error, 2=warn, 3=info, 4=debug, 5=trace), message, ctx.
 type LogCallbackFn = unsafe extern "C" fn(i32, *const c_char, *mut c_void);
@@ -144,8 +152,17 @@ impl log::Log for CLogger {
     }
 
     fn log(&self, record: &log::Record) {
-        let Ok(guard) = LOG_SINK.lock() else { return };
-        let Some(ref sink) = *guard else { return };
+        // Copy the callback pointer and context out, then release the lock BEFORE
+        // invoking the callback. Otherwise a sink that logs (directly or by
+        // re-entering a note_* function) would try to re-lock LOG_SINK on a thread
+        // that already holds it and deadlock (std Mutex is not reentrant).
+        let (cb, ctx) = {
+            let Ok(guard) = LOG_SINK.lock() else { return };
+            match *guard {
+                Some(ref sink) => (sink.cb, sink.ctx.ptr()),
+                None => return,
+            }
+        };
         let level = match record.level() {
             log::Level::Error => 1,
             log::Level::Warn => 2,
@@ -155,7 +172,7 @@ impl log::Log for CLogger {
         };
         if let Ok(cs) = CString::new(format!("{}", record.args()).replace('\0', " ")) {
             unsafe {
-                (sink.cb)(level, cs.as_ptr(), sink.ctx.ptr());
+                cb(level, cs.as_ptr(), ctx);
             }
         }
     }
@@ -181,6 +198,7 @@ static LOGGER: CLogger = CLogger;
 #[no_mangle]
 pub extern "C" fn note_init(db_path: *const c_char, model_path: *const c_char) -> *mut NoteHandle {
     let result = catch_unwind(|| {
+        clear_last_error();
         let db_path = match unsafe { cstr_to_str(db_path) } {
             Some(s) => s,
             None => {
@@ -272,6 +290,7 @@ pub extern "C" fn note_start_recording(
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         let device = unsafe { cstr_to_str(device_id) };
 
         // Guard against starting a new recording while one is active.
@@ -419,6 +438,7 @@ pub extern "C" fn note_stop_recording(handle: *mut NoteHandle) -> i32 {
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
 
         // Stop audio capture (drops the stream).
         if let Some(capture) = h.audio_capture.lock().unwrap().take() {
@@ -438,6 +458,7 @@ pub extern "C" fn note_stop_recording(handle: *mut NoteHandle) -> i32 {
         // End the meeting in the database.
         if let Some(meeting_id) = h.current_meeting_id.lock().unwrap().take() {
             if let Err(e) = h.db.end_meeting(meeting_id) {
+                set_last_error(format!("Failed to end meeting {}: {}", meeting_id, e));
                 error!("Failed to end meeting {}: {}", meeting_id, e);
                 return NOTE_ERR_INTERNAL;
             }
@@ -462,6 +483,7 @@ pub extern "C" fn note_pause_recording(handle: *mut NoteHandle) -> i32 {
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         let guard = h.audio_capture.lock().unwrap();
         if let Some(ref capture) = *guard {
             if let Err(e) = capture.pause() {
@@ -492,6 +514,7 @@ pub extern "C" fn note_resume_recording(handle: *mut NoteHandle) -> i32 {
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         let guard = h.audio_capture.lock().unwrap();
         if let Some(ref capture) = *guard {
             if let Err(e) = capture.resume() {
@@ -573,6 +596,7 @@ pub extern "C" fn note_summarize(handle: *mut NoteHandle, meeting_id: i64) -> *m
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
 
         // Gather all transcript segments for this meeting.
         let segments = match h.db.get_segments(meeting_id) {
@@ -676,6 +700,7 @@ pub extern "C" fn note_get_summary(handle: *mut NoteHandle, meeting_id: i64) -> 
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         match h.db.get_summary(meeting_id) {
             Ok(Some(summary)) => match serde_json::to_string(&summary) {
                 Ok(json) => string_to_cptr(json),
@@ -733,6 +758,7 @@ pub extern "C" fn note_list_meetings(
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         match h.db.list_meetings(limit, offset) {
             Ok(meetings) => match serde_json::to_string(&meetings) {
                 Ok(json) => string_to_cptr(json),
@@ -762,6 +788,7 @@ pub extern "C" fn note_get_meeting(handle: *mut NoteHandle, meeting_id: i64) -> 
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         match h.db.get_meeting(meeting_id) {
             Ok(Some(meeting)) => match serde_json::to_string(&meeting) {
                 Ok(json) => string_to_cptr(json),
@@ -794,6 +821,7 @@ pub extern "C" fn note_get_segments(handle: *mut NoteHandle, meeting_id: i64) ->
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         match h.db.get_segments(meeting_id) {
             Ok(segments) => match serde_json::to_string(&segments) {
                 Ok(json) => string_to_cptr(json),
@@ -833,6 +861,7 @@ pub extern "C" fn note_search_meetings(
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         let q = match unsafe { cstr_to_str(query) } {
             Some(s) => s,
             None => {
@@ -875,6 +904,7 @@ pub extern "C" fn note_update_meeting_title(
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         let t = match unsafe { cstr_to_str(title) } {
             Some(s) => s,
             None => {
@@ -909,12 +939,14 @@ pub extern "C" fn note_delete_meeting(handle: *mut NoteHandle, meeting_id: i64) 
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         match h.db.delete_meeting(meeting_id) {
             Ok(()) => {
                 info!("Deleted meeting {}", meeting_id);
                 NOTE_OK
             }
             Err(e) => {
+                set_last_error(format!("Failed to delete meeting {}: {}", meeting_id, e));
                 error!("Failed to delete meeting {}: {}", meeting_id, e);
                 NOTE_ERR_INTERNAL
             }
@@ -942,6 +974,7 @@ pub extern "C" fn note_export_meeting(
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         let fmt = match unsafe { cstr_to_str(format) } {
             Some(s) => s,
             None => {
@@ -978,6 +1011,7 @@ pub extern "C" fn note_set_setting(
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         let k = match unsafe { cstr_to_str(key) } {
             Some(s) => s,
             None => return NOTE_ERR_INVALID_ARG,
@@ -1009,6 +1043,7 @@ pub extern "C" fn note_get_setting(handle: *mut NoteHandle, key: *const c_char) 
     }
     match catch_unwind(|| {
         let h = unsafe { &*handle };
+        clear_last_error();
         let k = match unsafe { cstr_to_str(key) } {
             Some(s) => s,
             None => return std::ptr::null_mut(),
