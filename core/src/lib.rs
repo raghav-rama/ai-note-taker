@@ -25,11 +25,13 @@ use std::sync::{Arc, Mutex};
 
 use log::{error, info};
 
+use whisper_rs::WhisperContext;
+
 use crate::audio::AudioCapture;
 use crate::storage::Database;
 #[cfg(feature = "cloud")]
 use crate::summarize::Summarizer;
-use crate::transcribe::LocalTranscriber;
+use crate::transcribe::{self, LocalTranscriber, TranscriberConfig};
 
 // ── Error codes ──────────────────────────────────────────────────────
 
@@ -75,8 +77,101 @@ pub struct NoteHandle {
     current_meeting_id: Mutex<Option<i64>>,
     transcript_callback: Mutex<Option<(TranscriptCallbackFn, CallbackCtx)>>,
     audio_level: Arc<Mutex<f32>>,
+    /// Cached Whisper context keyed by the resolved model file path, so the model
+    /// is loaded once per model rather than on every recording start.
+    whisper_ctx: Mutex<Option<(String, Arc<WhisperContext>)>>,
+    /// Sender into the transcription pipeline when recording via `note_push_audio`
+    /// (system-audio feed) rather than the built-in microphone capture.
+    push_audio_tx: Mutex<Option<mpsc::Sender<Vec<f32>>>>,
     #[allow(dead_code)]
     runtime: tokio::runtime::Runtime,
+}
+
+impl NoteHandle {
+    /// Resolve the Whisper model file from `model_path` (a directory, or a legacy
+    /// file path whose parent is used) and the `whisper_model` setting.
+    fn resolve_model_file(&self) -> String {
+        let model_dir = {
+            let p = std::path::Path::new(&self.model_path);
+            if self.model_path.ends_with(".bin") {
+                p.parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            } else {
+                p.to_path_buf()
+            }
+        };
+        let model_name = self
+            .db
+            .get_setting("whisper_model")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "tiny".to_string());
+        model_dir
+            .join(format!("ggml-{}.bin", model_name))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Return the cached Whisper context for `model_file`, loading (and caching)
+    /// it if absent or if a different model was previously cached.
+    fn get_or_load_ctx(&self, model_file: &str) -> Result<Arc<WhisperContext>, anyhow::Error> {
+        let mut cache = self.whisper_ctx.lock().unwrap();
+        if let Some((path, ctx)) = cache.as_ref() {
+            if path == model_file {
+                return Ok(ctx.clone());
+            }
+        }
+        let ctx = transcribe::load_context(model_file)?;
+        *cache = Some((model_file.to_string(), ctx.clone()));
+        Ok(ctx)
+    }
+
+    /// Build transcription parameters from the `whisper_language` (default "en",
+    /// "auto" allowed) and `whisper_threads` (default 4) settings.
+    fn transcriber_config(&self) -> TranscriberConfig {
+        let language = self
+            .db
+            .get_setting("whisper_language")
+            .ok()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "en".to_string());
+        let n_threads = self
+            .db
+            .get_setting("whisper_threads")
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4);
+        TranscriberConfig {
+            language,
+            n_threads,
+        }
+    }
+
+    /// Build the transcript callback closure (wraps the stored C function pointer).
+    fn build_transcript_callback(&self) -> Option<transcribe::TranscriptCallback> {
+        let cb_lock = self.transcript_callback.lock().unwrap();
+        cb_lock.as_ref().map(|(fn_ptr, ctx)| {
+            let fn_ptr = *fn_ptr;
+            // Capture the whole Send-safe CallbackCtx wrapper (not the inner raw
+            // pointer) so the closure can move to the transcriber thread.
+            let ctx_wrapper = CallbackCtx(ctx.ptr());
+            let boxed: transcribe::TranscriptCallback =
+                Box::new(move |text: &str, timestamp: f64| {
+                    if let Ok(cs) = CString::new(text) {
+                        unsafe {
+                            fn_ptr(cs.as_ptr(), timestamp, ctx_wrapper.ptr());
+                        }
+                    }
+                });
+            boxed
+        })
+    }
 }
 
 // ── Helper functions ─────────────────────────────────────────────────
@@ -247,6 +342,8 @@ pub extern "C" fn note_init(db_path: *const c_char, model_path: *const c_char) -
             current_meeting_id: Mutex::new(None),
             transcript_callback: Mutex::new(None),
             audio_level: Arc::new(Mutex::new(0.0)),
+            whisper_ctx: Mutex::new(None),
+            push_audio_tx: Mutex::new(None),
             runtime,
         });
 
@@ -341,59 +438,26 @@ pub extern "C" fn note_start_recording(
             }
         };
 
-        // Build the transcript callback closure (wraps the C function pointer).
-        let cb_lock = h.transcript_callback.lock().unwrap();
-        let callback: Option<transcribe::TranscriptCallback> =
-            cb_lock.as_ref().map(|(fn_ptr, ctx)| {
-                let fn_ptr = *fn_ptr;
-                // Wrap the raw pointer in our Send-safe wrapper so the
-                // closure can be moved to the transcriber thread.
-                // Use .ptr() method so that Rust 2021 captures the whole
-                // CallbackCtx (which is Send) rather than the inner *mut c_void.
-                let ctx_wrapper = CallbackCtx(ctx.ptr());
-                let boxed: transcribe::TranscriptCallback =
-                    Box::new(move |text: &str, timestamp: f64| {
-                        if let Ok(cs) = CString::new(text) {
-                            unsafe {
-                                fn_ptr(cs.as_ptr(), timestamp, ctx_wrapper.ptr());
-                            }
-                        }
-                    });
-                boxed
-            });
-        drop(cb_lock);
+        // Build the transcript callback, then resolve + load the (cached) model
+        // and start the transcriber. The context is loaded once per model and
+        // reused across recordings, so only the first start pays the load cost.
+        let callback = h.build_transcript_callback();
 
-        // Resolve the models directory, then compose the model file from the
-        // configured `whisper_model` (default "tiny"). `model_path` is normally a
-        // directory (Linux/Android/iOS); legacy callers (macOS/Windows) pass a
-        // model *file* path, so we take that file's parent as the directory.
-        // Deriving the directory (rather than using a file path verbatim) means
-        // the selected model is honored on every platform and a file path never
-        // gets doubled into `.../ggml-tiny.bin/ggml-...bin`.
-        let model_dir = {
-            let p = std::path::Path::new(&h.model_path);
-            if h.model_path.ends_with(".bin") {
-                p.parent()
-                    .map(|d| d.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-            } else {
-                p.to_path_buf()
+        let model_file = h.resolve_model_file();
+        let ctx = match h.get_or_load_ctx(&model_file) {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(format!("Failed to load Whisper model: {}", e));
+                error!("Failed to load Whisper model: {}", e);
+                cleanup();
+                return NOTE_ERR_INTERNAL;
             }
         };
-        let model_name = h
-            .db
-            .get_setting("whisper_model")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "tiny".to_string());
-        let model_file = model_dir
-            .join(format!("ggml-{}.bin", model_name))
-            .to_string_lossy()
-            .into_owned();
+        let config = h.transcriber_config();
 
-        // Start the transcriber.
         let transcriber = match LocalTranscriber::new(
-            &model_file,
+            ctx,
+            config,
             audio_rx,
             h.db.clone(),
             meeting_id,
@@ -427,6 +491,123 @@ pub extern "C" fn note_start_recording(
     }
 }
 
+/// Start recording from an external audio feed instead of the microphone.
+///
+/// No microphone `AudioCapture` is created; the native layer must feed resampled
+/// 16kHz mono f32 samples via [`note_push_audio`]. This is the entry point for
+/// system-audio capture (ScreenCaptureKit, WASAPI loopback, PipeWire monitors).
+///
+/// Returns 0 on success, or a negative error code.
+#[no_mangle]
+pub extern "C" fn note_start_recording_push(handle: *mut NoteHandle) -> i32 {
+    if handle.is_null() {
+        return NOTE_ERR_NULL_PTR;
+    }
+    match catch_unwind(|| {
+        let h = unsafe { &*handle };
+        clear_last_error();
+
+        if h.current_meeting_id.lock().unwrap().is_some() {
+            set_last_error("Cannot start recording: a recording session is already active");
+            error!("Cannot start recording: a recording session is already active");
+            return NOTE_ERR_INTERNAL;
+        }
+
+        let meeting_id = match h.db.create_meeting("Untitled Meeting") {
+            Ok(id) => id,
+            Err(e) => {
+                set_last_error(format!("Failed to create meeting: {}", e));
+                error!("Failed to create meeting: {}", e);
+                return NOTE_ERR_INTERNAL;
+            }
+        };
+        *h.current_meeting_id.lock().unwrap() = Some(meeting_id);
+
+        let cleanup = || {
+            *h.current_meeting_id.lock().unwrap() = None;
+            let _ = h.db.delete_meeting(meeting_id);
+        };
+
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
+        let callback = h.build_transcript_callback();
+
+        let model_file = h.resolve_model_file();
+        let ctx = match h.get_or_load_ctx(&model_file) {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(format!("Failed to load Whisper model: {}", e));
+                error!("Failed to load Whisper model: {}", e);
+                cleanup();
+                return NOTE_ERR_INTERNAL;
+            }
+        };
+        let config = h.transcriber_config();
+
+        let transcriber = match LocalTranscriber::new(
+            ctx,
+            config,
+            audio_rx,
+            h.db.clone(),
+            meeting_id,
+            callback,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(format!("Failed to start transcriber: {}", e));
+                error!("Failed to start transcriber: {}", e);
+                cleanup();
+                return NOTE_ERR_INTERNAL;
+            }
+        };
+
+        *h.push_audio_tx.lock().unwrap() = Some(audio_tx);
+        *h.transcriber.lock().unwrap() = Some(transcriber);
+
+        info!("Push recording started for meeting {}", meeting_id);
+        NOTE_OK
+    }) {
+        Ok(code) => code,
+        Err(_) => NOTE_ERR_PANIC,
+    }
+}
+
+/// Feed a block of audio into an active push-mode recording.
+///
+/// - `samples`: pointer to `count` 32-bit float samples, 16kHz mono, in [-1.0, 1.0].
+/// - `count`: number of samples (0 is a no-op success).
+///
+/// Requires a session started with [`note_start_recording_push`]. Returns 0 on
+/// success, or a negative error code.
+#[no_mangle]
+pub extern "C" fn note_push_audio(handle: *mut NoteHandle, samples: *const f32, count: usize) -> i32 {
+    if handle.is_null() || samples.is_null() {
+        return NOTE_ERR_NULL_PTR;
+    }
+    match catch_unwind(|| {
+        let h = unsafe { &*handle };
+        let guard = h.push_audio_tx.lock().unwrap();
+        let tx = match guard.as_ref() {
+            Some(tx) => tx,
+            None => {
+                set_last_error("note_push_audio: no push-mode recording is active");
+                return NOTE_ERR_NOT_FOUND;
+            }
+        };
+        // `count == 0` yields an empty (never-dereferenced) slice.
+        let slice = unsafe { std::slice::from_raw_parts(samples, count) };
+        match tx.send(slice.to_vec()) {
+            Ok(()) => NOTE_OK,
+            Err(_) => {
+                set_last_error("note_push_audio: transcription pipeline has closed");
+                NOTE_ERR_INTERNAL
+            }
+        }
+    }) {
+        Ok(code) => code,
+        Err(_) => NOTE_ERR_PANIC,
+    }
+}
+
 /// Stop the current recording session.
 ///
 /// Finalizes the meeting, stops audio capture and transcription.
@@ -440,12 +621,16 @@ pub extern "C" fn note_stop_recording(handle: *mut NoteHandle) -> i32 {
         let h = unsafe { &*handle };
         clear_last_error();
 
-        // Stop audio capture (drops the stream).
+        // Stop audio capture (drops the stream, closing its sender).
         if let Some(capture) = h.audio_capture.lock().unwrap().take() {
             let _ = capture.stop();
         }
 
-        // Stop transcriber (processes remaining buffer).
+        // Close the push-audio sender too (push mode has no AudioCapture), so the
+        // transcriber's drain sees a disconnected channel and terminates.
+        let _ = h.push_audio_tx.lock().unwrap().take();
+
+        // Stop transcriber (processes the remaining buffer and joins its thread).
         if let Some(transcriber) = h.transcriber.lock().unwrap().take() {
             transcriber.stop();
         }

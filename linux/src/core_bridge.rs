@@ -6,7 +6,9 @@
 use notetaker::audio::{self, AudioCapture, AudioLevelCallback};
 use notetaker::models::{AudioDevice, Meeting, TranscriptSegment};
 use notetaker::storage::Database;
-use notetaker::transcribe::{LocalTranscriber, TranscriptCallback};
+use notetaker::transcribe::{
+    self, LocalTranscriber, TranscriberConfig, TranscriptCallback, WhisperContext,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -19,6 +21,8 @@ pub struct CoreBridge {
     current_meeting_id: Arc<Mutex<Option<i64>>>,
     audio_level: Arc<Mutex<f32>>,
     transcript_tx: Arc<Mutex<Option<async_channel::Sender<TranscriptSegment>>>>,
+    /// Whisper context cached by resolved model-file path so the model loads once.
+    whisper_ctx: Arc<Mutex<Option<(String, Arc<WhisperContext>)>>>,
     recording: Arc<AtomicBool>,
     rt: Handle,
 }
@@ -34,6 +38,7 @@ impl CoreBridge {
             current_meeting_id: Arc::new(Mutex::new(None)),
             audio_level: Arc::new(Mutex::new(0.0)),
             transcript_tx: Arc::new(Mutex::new(None)),
+            whisper_ctx: Arc::new(Mutex::new(None)),
             recording: Arc::new(AtomicBool::new(false)),
             rt,
         })
@@ -60,6 +65,7 @@ impl CoreBridge {
         let level = self.audio_level.clone();
         let transcript_tx = self.transcript_tx.clone();
         let model_dir = self.model_path.clone();
+        let whisper_ctx = self.whisper_ctx.clone();
 
         let outcome = self
             .rt
@@ -100,8 +106,41 @@ impl CoreBridge {
                         .unwrap_or_else(|| "tiny".to_string());
                     let model_file = format!("{model_dir}/ggml-{model_name}.bin");
 
+                    // Load the model once and cache it by path; later recordings
+                    // reuse the context instead of reloading (seconds of work).
+                    let ctx = {
+                        let mut cache = whisper_ctx.lock().unwrap();
+                        match cache.as_ref() {
+                            Some((p, c)) if p == &model_file => c.clone(),
+                            _ => {
+                                let c = transcribe::load_context(&model_file)
+                                    .map_err(|e| e.to_string())?;
+                                *cache = Some((model_file.clone(), c.clone()));
+                                c
+                            }
+                        }
+                    };
+
+                    // Transcription parameters from settings.
+                    let language = db
+                        .get_setting("whisper_language")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "en".to_string());
+                    let n_threads = db
+                        .get_setting("whisper_threads")
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or(4);
+                    let config = TranscriberConfig { language, n_threads };
+
                     let transcriber = LocalTranscriber::new(
-                        &model_file,
+                        ctx,
+                        config,
                         audio_rx,
                         db.clone(),
                         meeting_id,

@@ -328,3 +328,12 @@ jobs:
 
       - name: Assert transcript content
         run: grep -i country transcript-out.txt
+
+      # Exercise the FFI push-audio path (note_start_recording_push + note_push_audio)
+      # with raw PCM, proving system-audio feed works end to end (P2-5 DoD).
+      - name: Transcribe fixture via FFI push-audio
+        shell: bash
+        run: cargo run --release -p notetaker-core --bin transcribe-wav -- --via-ffi samples/jfk.wav models/ggml-tiny.bin | tee transcript-ffi-out.txt
+
+      - name: Assert FFI transcript content
+        run: grep -i country transcript-ffi-out.txt

@@ -56,6 +56,24 @@ void note_destroy(struct NoteHandle *handle);
 // Returns 0 on success, or a negative error code.
 int32_t note_start_recording(struct NoteHandle *handle, const char *device_id);
 
+// Start recording from an external audio feed instead of the microphone.
+//
+// No microphone `AudioCapture` is created; the native layer must feed resampled
+// 16kHz mono f32 samples via [`note_push_audio`]. This is the entry point for
+// system-audio capture (ScreenCaptureKit, WASAPI loopback, PipeWire monitors).
+//
+// Returns 0 on success, or a negative error code.
+int32_t note_start_recording_push(struct NoteHandle *handle);
+
+// Feed a block of audio into an active push-mode recording.
+//
+// - `samples`: pointer to `count` 32-bit float samples, 16kHz mono, in [-1.0, 1.0].
+// - `count`: number of samples (0 is a no-op success).
+//
+// Requires a session started with [`note_start_recording_push`]. Returns 0 on
+// success, or a negative error code.
+int32_t note_push_audio(struct NoteHandle *handle, const float *samples, uintptr_t count);
+
 // Stop the current recording session.
 //
 // Finalizes the meeting, stops audio capture and transcription.
