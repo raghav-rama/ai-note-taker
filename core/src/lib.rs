@@ -74,6 +74,7 @@ pub struct NoteHandle {
     transcriber: Mutex<Option<LocalTranscriber>>,
     current_meeting_id: Mutex<Option<i64>>,
     transcript_callback: Mutex<Option<(TranscriptCallbackFn, CallbackCtx)>>,
+    audio_level: Arc<Mutex<f32>>,
     #[allow(dead_code)]
     runtime: tokio::runtime::Runtime,
 }
@@ -102,7 +103,8 @@ fn string_to_cptr(s: String) -> *mut c_char {
 /// Initialize the notetaker engine.
 ///
 /// - `db_path`: path to the SQLite database file (created if absent).
-/// - `model_path`: path to the Whisper GGML model file.
+/// - `model_path`: path to the directory containing Whisper GGML model files
+///   (the specific model is selected per recording via the `whisper_model` setting).
 ///
 /// Returns an opaque `NoteHandle*` on success, or null on failure.
 #[no_mangle]
@@ -151,6 +153,7 @@ pub extern "C" fn note_init(db_path: *const c_char, model_path: *const c_char) -
             transcriber: Mutex::new(None),
             current_meeting_id: Mutex::new(None),
             transcript_callback: Mutex::new(None),
+            audio_level: Arc::new(Mutex::new(0.0)),
             runtime,
         });
 
@@ -213,14 +216,30 @@ pub extern "C" fn note_start_recording(
 
         *h.current_meeting_id.lock().unwrap() = Some(meeting_id);
 
+        // Roll back the active-session state and the orphan meeting row when
+        // setup fails after the meeting has been created.
+        let cleanup = || {
+            *h.current_meeting_id.lock().unwrap() = None;
+            let _ = h.db.delete_meeting(meeting_id);
+        };
+
         // Set up the audio -> transcriber pipeline.
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
 
+        // Mirror the RMS level into shared state for `note_get_audio_level`.
+        let level_arc = h.audio_level.clone();
+        let level_cb: audio::AudioLevelCallback = Box::new(move |lvl: f32| {
+            if let Ok(mut g) = level_arc.lock() {
+                *g = lvl;
+            }
+        });
+
         // Build the audio capture.
-        let capture = match AudioCapture::new(device, audio_tx, None) {
+        let capture = match AudioCapture::new(device, audio_tx, Some(level_cb)) {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create audio capture: {}", e);
+                cleanup();
                 return NOTE_ERR_INTERNAL;
             }
         };
@@ -247,9 +266,37 @@ pub extern "C" fn note_start_recording(
             });
         drop(cb_lock);
 
+        // Resolve the models directory, then compose the model file from the
+        // configured `whisper_model` (default "tiny"). `model_path` is normally a
+        // directory (Linux/Android/iOS); legacy callers (macOS/Windows) pass a
+        // model *file* path, so we take that file's parent as the directory.
+        // Deriving the directory (rather than using a file path verbatim) means
+        // the selected model is honored on every platform and a file path never
+        // gets doubled into `.../ggml-tiny.bin/ggml-...bin`.
+        let model_dir = {
+            let p = std::path::Path::new(&h.model_path);
+            if h.model_path.ends_with(".bin") {
+                p.parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            } else {
+                p.to_path_buf()
+            }
+        };
+        let model_name = h
+            .db
+            .get_setting("whisper_model")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "tiny".to_string());
+        let model_file = model_dir
+            .join(format!("ggml-{}.bin", model_name))
+            .to_string_lossy()
+            .into_owned();
+
         // Start the transcriber.
         let transcriber = match LocalTranscriber::new(
-            &h.model_path,
+            &model_file,
             audio_rx,
             h.db.clone(),
             meeting_id,
@@ -258,6 +305,7 @@ pub extern "C" fn note_start_recording(
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to start transcriber: {}", e);
+                cleanup();
                 return NOTE_ERR_INTERNAL;
             }
         };
@@ -265,6 +313,7 @@ pub extern "C" fn note_start_recording(
         // Start audio capture.
         if let Err(e) = capture.start() {
             error!("Failed to start audio: {}", e);
+            cleanup();
             return NOTE_ERR_INTERNAL;
         }
 
@@ -299,6 +348,11 @@ pub extern "C" fn note_stop_recording(handle: *mut NoteHandle) -> i32 {
         // Stop transcriber (processes remaining buffer).
         if let Some(transcriber) = h.transcriber.lock().unwrap().take() {
             transcriber.stop();
+        }
+
+        // Reset the metered level so note_get_audio_level reads 0 when idle.
+        if let Ok(mut g) = h.audio_level.lock() {
+            *g = 0.0;
         }
 
         // End the meeting in the database.
@@ -344,6 +398,22 @@ pub extern "C" fn note_pause_recording(handle: *mut NoteHandle) -> i32 {
         Ok(code) => code,
         Err(_) => NOTE_ERR_PANIC,
     }
+}
+
+/// Get the most recent RMS audio input level (0.0 to 1.0).
+///
+/// Returns the level for UI metering, or 0.0 if the handle is null or no
+/// recording is active.
+#[no_mangle]
+pub extern "C" fn note_get_audio_level(handle: *mut NoteHandle) -> f32 {
+    if handle.is_null() {
+        return 0.0;
+    }
+    catch_unwind(|| {
+        let h = unsafe { &*handle };
+        h.audio_level.lock().map(|g| *g).unwrap_or(0.0)
+    })
+    .unwrap_or(0.0)
 }
 
 // ── Transcription callback ───────────────────────────────────────────

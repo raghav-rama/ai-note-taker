@@ -10,7 +10,7 @@ A privacy-focused, on-device meeting assistant that captures audio, transcribes 
 - **Cross-platform** native apps for macOS, iOS, Windows, Linux, and Android
 - **Privacy-first** — audio and transcripts stay on your device
 - **Invisible to screen sharing** — window is excluded from screen capture
-- **Encrypted local storage** via SQLite with SQLCipher
+- **Local storage** via local SQLite (unencrypted)
 
 ## Architecture
 

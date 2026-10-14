@@ -61,9 +61,9 @@ make test
 ## Key decisions
 
 - **Native apps, not cross-platform framework** — Each platform gets its own UI in the idiomatic toolkit. The Rust core is the shared layer, exposed via C FFI.
-- **Local-first transcription** — whisper.cpp runs on-device. Cloud (OpenAI Whisper API) is opt-in fallback behind a feature flag.
-- **SQLite for storage** — All data local. FTS5 for full-text search across transcripts.
-- **No telemetry, no analytics** — Nothing phones home unless the user explicitly enables cloud transcription or summarization.
+- **Local-only transcription** — whisper.cpp runs on-device. There is no cloud transcription. Cloud is used only for summarization via the Anthropic API behind the `cloud` feature flag.
+- **SQLite for storage** — All data local in an unencrypted SQLite database. FTS5 for full-text search across transcripts.
+- **No telemetry, no analytics** — Nothing phones home unless the user explicitly enables cloud summarization.
 
 ## Design spec
 

@@ -87,7 +87,7 @@ final class MeetingViewModel {
 
         // Load persisted settings.
         useCloudTranscription = (coreBridge.getSetting(key: "use_cloud") == "true")
-        selectedModelName = coreBridge.getSetting(key: "model_name") ?? "tiny"
+        selectedModelName = coreBridge.getSetting(key: "whisper_model") ?? "tiny"
         appDisplayName = coreBridge.getSetting(key: "app_display_name") ?? "System Helper"
     }
 

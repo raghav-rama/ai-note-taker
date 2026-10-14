@@ -276,7 +276,10 @@ build_android() {
         log_warn "  whisper.cpp C build may fail"
     fi
 
-    # Build using cargo-ndk
+    # Build using cargo-ndk. --lib is required: the crate now also defines a
+    # [[bin]] (transcribe-wav), and without --lib cargo-ndk would cross-compile
+    # that executable for the Android targets, linking whisper.cpp's C++ into an
+    # executable (not the cdylib) and failing libc++ symbol resolution.
     cargo ndk \
         -t arm64-v8a \
         -t armeabi-v7a \
@@ -284,6 +287,7 @@ build_android() {
         -o "$out_dir/jniLibs" \
         build \
         -p "$CRATE_NAME" \
+        --lib \
         $(build_profile_flag)
 
     log_info "Android libraries: $out_dir/jniLibs/"

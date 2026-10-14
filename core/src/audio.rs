@@ -38,7 +38,7 @@ pub struct AudioCapture {
 }
 
 /// State for linear interpolation resampling.
-struct Resampler {
+pub struct Resampler {
     source_rate: u32,
     target_rate: u32,
     channels: u16,
@@ -49,7 +49,7 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn new(source_rate: u32, target_rate: u32, channels: u16) -> Self {
+    pub fn new(source_rate: u32, target_rate: u32, channels: u16) -> Self {
         Self {
             source_rate,
             target_rate,
@@ -60,7 +60,7 @@ impl Resampler {
     }
 
     /// Resample interleaved multi-channel input to mono 16kHz f32.
-    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
         // First downmix to mono by averaging channels.
         let mono: Vec<f32> = input
             .chunks(self.channels as usize)
@@ -340,4 +340,50 @@ pub fn list_audio_devices() -> Result<Vec<AudioDevice>> {
         }
     }
     Ok(devices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Resampler;
+
+    #[test]
+    fn downmixes_interleaved_stereo_to_mono() {
+        // Two stereo frames at a matching rate: channels are averaged, no resample.
+        let mut r = Resampler::new(16000, 16000, 2);
+        let out = r.process(&[1.0, 3.0, -2.0, 2.0]);
+        assert_eq!(out, vec![2.0, 0.0]);
+    }
+
+    #[test]
+    fn resamples_48k_to_16k_via_interpolation() {
+        // source_rate != target_rate drives the interpolation path that the
+        // 16kHz jfk.wav smoke-test fixture never exercises. 48k -> 16k keeps
+        // roughly one of every three input samples.
+        let mut r = Resampler::new(48000, 16000, 1);
+        let input: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.01).sin()).collect();
+        let out = r.process(&input);
+
+        let expected = input.len() / 3;
+        assert!(
+            (out.len() as i64 - expected as i64).abs() <= 2,
+            "expected ~{expected} samples, got {}",
+            out.len()
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn upsamples_8k_to_16k_via_interpolation() {
+        // Upsampling exercises the same path in the other direction (~2x samples).
+        let mut r = Resampler::new(8000, 16000, 1);
+        let input: Vec<f32> = (0..800).map(|i| (i as f32 * 0.02).sin()).collect();
+        let out = r.process(&input);
+
+        let expected = input.len() * 2;
+        assert!(
+            (out.len() as i64 - expected as i64).abs() <= 2,
+            "expected ~{expected} samples, got {}",
+            out.len()
+        );
+    }
 }

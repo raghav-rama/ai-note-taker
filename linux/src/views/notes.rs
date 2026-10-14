@@ -1,6 +1,6 @@
 use adw::prelude::*;
-use gtk::glib;
-use std::cell::RefCell;
+use gtk::{gio, glib};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -134,11 +134,105 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     // ── State: current meeting ID ──────────────────────────────────────
 
     let current_meeting_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
+    // Monotonic token bumped on every `notes.load`. Async tasks capture it and
+    // bail if it advanced, so any later activation — even re-selecting the SAME
+    // meeting — invalidates an in-flight load or summary rather than letting a
+    // slow result overwrite the current view.
+    let load_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+
+    // "load" action — invoked from the History view when a meeting is selected.
+    // It carries the meeting id as an int64 parameter, sets it as the current
+    // meeting, and loads the meeting's title and transcript into the view.
+    {
+        let bridge_ref = bridge.clone();
+        let meeting_id = current_meeting_id.clone();
+        let load_gen = load_gen.clone();
+        let summary = summary_label.clone();
+        let transcript = transcript_label.clone();
+        let kp = key_points_label.clone();
+        let ai = action_items_label.clone();
+        let dec = decisions_label.clone();
+
+        let actions = gio::SimpleActionGroup::new();
+        let load_action = gio::SimpleAction::new("load", Some(glib::VariantTy::INT64));
+        load_action.connect_activate(move |_, param| {
+            let Some(mid) = param.and_then(|v| v.get::<i64>()) else {
+                return;
+            };
+            let gen = load_gen.get().wrapping_add(1);
+            load_gen.set(gen);
+            *meeting_id.borrow_mut() = Some(mid);
+
+            // Clear sections parsed from any previously viewed meeting.
+            kp.set_label("");
+            ai.set_label("");
+            dec.set_label("");
+
+            let bridge_c = bridge_ref.clone();
+            let summary_c = summary.clone();
+            let transcript_c = transcript.clone();
+            let kp_c = kp.clone();
+            let ai_c = ai.clone();
+            let dec_c = dec.clone();
+            let gen_c = load_gen.clone();
+            glib::spawn_future_local(async move {
+                let meeting = bridge_c.get_meeting(mid).await;
+                // Discard if a newer load activation has happened since (another
+                // meeting, or this same meeting re-selected), so a slow fetch
+                // can't clobber the current view.
+                if gen_c.get() != gen {
+                    return;
+                }
+                match meeting {
+                    Ok(meeting) => {
+                        match meeting.summary.as_deref() {
+                            // A summary was generated earlier and stored — show it
+                            // (and its parsed sections) instead of the prompt.
+                            Some(s) if !s.trim().is_empty() => {
+                                summary_c.set_label(s);
+                                let sections = parse_summary_sections(s);
+                                kp_c.set_label(&sections.key_points);
+                                ai_c.set_label(&sections.action_items);
+                                dec_c.set_label(&sections.decisions);
+                            }
+                            _ => summary_c.set_label(&format!(
+                                "{}\n\nPress \u{201c}Generate Summary\u{201d} to create notes.",
+                                meeting.title
+                            )),
+                        }
+                        summary_c.remove_css_class("dim-label");
+                    }
+                    Err(e) => summary_c.set_label(&format!("Failed to load meeting: {e}")),
+                }
+
+                let transcript = bridge_c.get_transcript(mid).await;
+                if gen_c.get() != gen {
+                    return;
+                }
+                match transcript {
+                    Ok(segments) => {
+                        let text = segments
+                            .iter()
+                            .map(|s| {
+                                format!("[{:.1}s] {}", s.timestamp_ms as f64 / 1000.0, s.text)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        transcript_c.set_label(&text);
+                    }
+                    Err(e) => transcript_c.set_label(&format!("Failed to load transcript: {e}")),
+                }
+            });
+        });
+        actions.add_action(&load_action);
+        outer.insert_action_group("notes", Some(&actions));
+    }
 
     // Generate summary button handler.
     {
         let bridge_ref = bridge.clone();
         let meeting_id = current_meeting_id.clone();
+        let load_gen = load_gen.clone();
         let summary = summary_label.clone();
         let kp = key_points_label.clone();
         let ai = action_items_label.clone();
@@ -152,15 +246,26 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
             };
 
             btn.set_sensitive(false);
+            let gen = load_gen.get();
             let bridge_c = bridge_ref.clone();
             let summary_c = summary.clone();
             let kp_c = kp.clone();
             let ai_c = ai.clone();
             let dec_c = dec.clone();
             let btn_c = btn.clone();
+            let gen_c = load_gen.clone();
 
             glib::spawn_future_local(async move {
-                match bridge_c.summarize(mid).await {
+                let result = bridge_c.summarize(mid).await;
+                // Discard if any load activation happened after this summary was
+                // requested (another meeting, or this one re-selected), so it
+                // can't overwrite the now-current meeting's view while Export
+                // would operate on the newer selection.
+                if gen_c.get() != gen {
+                    btn_c.set_sensitive(true);
+                    return;
+                }
+                match result {
                     Ok(text) => {
                         // The summary is expected as plain text. A more
                         // sophisticated implementation would parse structured

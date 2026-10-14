@@ -139,7 +139,7 @@ struct SettingsView: View {
             viewModel.saveSetting(key: "use_cloud", value: newValue ? "true" : "false")
         }
         .onChange(of: viewModel.selectedModelName) { _, newValue in
-            viewModel.saveSetting(key: "model_name", value: newValue)
+            viewModel.saveSetting(key: "whisper_model", value: newValue)
         }
         .onChange(of: viewModel.appDisplayName) { _, newValue in
             viewModel.saveSetting(key: "app_display_name", value: newValue)

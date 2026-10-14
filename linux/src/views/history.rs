@@ -110,6 +110,25 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                             let arrow = gtk::Image::from_icon_name("go-next-symbolic");
                             row.add_suffix(&arrow);
 
+                            // On activation, switch to the Notes page and ask it
+                            // to load this meeting. The Notes view installs a
+                            // "notes.load" action taking the meeting id.
+                            let mid = meeting.id;
+                            row.connect_activated(move |row| {
+                                if let Some(stack) = row
+                                    .ancestor(adw::ViewStack::static_type())
+                                    .and_then(|w| w.downcast::<adw::ViewStack>().ok())
+                                {
+                                    if let Some(notes) = stack.child_by_name("notes") {
+                                        let _ = notes.activate_action(
+                                            "notes.load",
+                                            Some(&mid.to_variant()),
+                                        );
+                                    }
+                                    stack.set_visible_child_name("notes");
+                                }
+                            });
+
                             list_c.append(&row);
                         }
                     }

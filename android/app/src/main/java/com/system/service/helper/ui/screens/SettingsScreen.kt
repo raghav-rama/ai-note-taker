@@ -59,7 +59,7 @@ fun SettingsScreen() {
     // Load settings from core
     LaunchedEffect(Unit) {
         whisperApiKey = CoreBridge.getSetting("whisper_api_key") ?: ""
-        claudeApiKey = CoreBridge.getSetting("claude_api_key") ?: ""
+        claudeApiKey = CoreBridge.getSetting("anthropic_api_key") ?: ""
         useCloudTranscription = CoreBridge.getSetting("use_cloud") == "true"
         selectedModel = CoreBridge.getSetting("whisper_model") ?: "tiny"
         devices = loadAudioDevices()
@@ -159,7 +159,7 @@ fun SettingsScreen() {
             value = claudeApiKey,
             onValueChange = {
                 claudeApiKey = it
-                CoreBridge.setSetting("claude_api_key", it)
+                CoreBridge.setSetting("anthropic_api_key", it)
             },
             placeholder = "sk-ant-...",
         )

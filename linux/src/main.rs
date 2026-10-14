@@ -22,8 +22,54 @@ fn main() {
     std::fs::create_dir_all(&data_dir).ok();
 
     let db_path = data_dir.join("data.db");
-    let model_path = data_dir.join("models");
-    std::fs::create_dir_all(&model_path).ok();
+
+    // Whisper models: prefer whichever known location already holds a ggml-*.bin
+    // model, checked in order:
+    //   1. next to the executable  — packaged/downloadable artifact
+    //   2. ./models in the CWD      — source build (scripts/download-model.sh)
+    //   3. the XDG data dir         — written by the in-app downloader
+    // Only when none has a model do we create a directory (XDG, else exe-dir,
+    // else CWD) for a future download.
+    let model_path = {
+        let has_model = |dir: &std::path::Path| -> bool {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries.flatten().any(|e| {
+                        let name = e.file_name();
+                        let name = name.to_string_lossy();
+                        name.starts_with("ggml-") && name.ends_with(".bin")
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let exe_models = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("models")));
+        let cwd_models = std::path::PathBuf::from("models");
+        let xdg_models = data_dir.join("models");
+
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(ref d) = exe_models {
+            candidates.push(d.clone());
+        }
+        candidates.push(cwd_models.clone());
+        candidates.push(xdg_models.clone());
+
+        match candidates.into_iter().find(|d| has_model(d)) {
+            Some(dir) => dir,
+            None => {
+                if std::fs::create_dir_all(&xdg_models).is_ok() {
+                    xdg_models
+                } else if let Some(exe_dir) = exe_models {
+                    std::fs::create_dir_all(&exe_dir).ok();
+                    exe_dir
+                } else {
+                    std::fs::create_dir_all(&cwd_models).ok();
+                    cwd_models
+                }
+            }
+        }
+    };
 
     // Initialize the core bridge that wraps notetaker-core.
     let bridge = match CoreBridge::new(
