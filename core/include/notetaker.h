@@ -56,6 +56,24 @@ void note_destroy(struct NoteHandle *handle);
 // Returns 0 on success, or a negative error code.
 int32_t note_start_recording(struct NoteHandle *handle, const char *device_id);
 
+// Start recording from an external audio feed instead of the microphone.
+//
+// No microphone `AudioCapture` is created; the native layer must feed resampled
+// 16kHz mono f32 samples via [`note_push_audio`]. This is the entry point for
+// system-audio capture (ScreenCaptureKit, WASAPI loopback, PipeWire monitors).
+//
+// Returns 0 on success, or a negative error code.
+int32_t note_start_recording_push(struct NoteHandle *handle);
+
+// Feed a block of audio into an active push-mode recording.
+//
+// - `samples`: pointer to `count` 32-bit float samples, 16kHz mono, in [-1.0, 1.0].
+// - `count`: number of samples (0 is a no-op success).
+//
+// Requires a session started with [`note_start_recording_push`]. Returns 0 on
+// success, or a negative error code.
+int32_t note_push_audio(struct NoteHandle *handle, const float *samples, uintptr_t count);
+
 // Stop the current recording session.
 //
 // Finalizes the meeting, stops audio capture and transcription.
@@ -67,6 +85,11 @@ int32_t note_stop_recording(struct NoteHandle *handle);
 // Audio capture is paused but the meeting remains active.
 // Returns 0 on success, or a negative error code.
 int32_t note_pause_recording(struct NoteHandle *handle);
+
+// Resume a paused recording session.
+//
+// Returns 0 on success, or a negative error code.
+int32_t note_resume_recording(struct NoteHandle *handle);
 
 // Get the most recent RMS audio input level (0.0 to 1.0).
 //
@@ -91,6 +114,14 @@ void note_set_transcript_callback(struct NoteHandle *handle,
 // Requires the `cloud` feature and a configured API key (setting `anthropic_api_key`).
 char *note_summarize(struct NoteHandle *handle, int64_t meeting_id);
 
+// Get a previously generated structured summary for a meeting as JSON.
+//
+// Returns a JSON object (`{summary, key_points, action_items, decisions}`), or
+// null if none has been generated or on error. Free with [`note_free_string`].
+// Unlike [`note_summarize`], this does not require the `cloud` feature or network
+// access -- it reads what was stored at summarization time.
+char *note_get_summary(struct NoteHandle *handle, int64_t meeting_id);
+
 // Free a string previously returned by the notetaker library.
 //
 // Passing null is safe (no-op).
@@ -108,6 +139,24 @@ char *note_list_meetings(struct NoteHandle *handle, int32_t limit, int32_t offse
 //
 // Returns a JSON string, or null if not found or on error. Free with [`note_free_string`].
 char *note_get_meeting(struct NoteHandle *handle, int64_t meeting_id);
+
+// Get all transcript segments for a meeting as a JSON array.
+//
+// Returns a JSON string (possibly an empty array), or null on error.
+// Free with [`note_free_string`].
+char *note_get_segments(struct NoteHandle *handle, int64_t meeting_id);
+
+// Search meetings by transcript text (FTS5).
+//
+// Returns a JSON array of the meetings whose transcripts match `query`, newest
+// first (possibly an empty array), or null on error. Free with
+// [`note_free_string`].
+char *note_search_meetings(struct NoteHandle *handle, const char *query);
+
+// Update a meeting's title.
+//
+// Returns 0 on success, or a negative error code.
+int32_t note_update_meeting_title(struct NoteHandle *handle, int64_t meeting_id, const char *title);
 
 // Delete a meeting and all its associated data.
 //
@@ -138,5 +187,25 @@ char *note_get_setting(struct NoteHandle *handle, const char *key);
 // Does not require an active `NoteHandle` (the handle parameter is for
 // API consistency but the implementation uses the system audio host).
 char *note_list_audio_devices(struct NoteHandle *_handle);
+
+// Return the most recent error message for the calling thread, or null if none.
+//
+// The returned string is caller-owned; free it with [`note_free_string`].
+// Call this after an FFI function reports failure (a negative code or a null
+// return) to get a human-readable reason.
+char *note_last_error(void);
+
+// Install a structured log callback.
+//
+// - `cb`: `void(int level, const char* message, void* ctx)` invoked for each log
+//   record, or null to detach the current sink. The message pointer is only
+//   valid for the duration of the call. Levels: 1=error, 2=warn, 3=info,
+//   4=debug, 5=trace.
+// - `ctx`: opaque context pointer passed through to the callback.
+//
+// The underlying logger is installed once per process; if another logger was
+// already installed (for example by the host app), the callback is stored but
+// will not receive records.
+void note_set_log_callback(void (*cb)(int32_t, const char*, void*), void *ctx);
 
 #endif  /* NOTETAKER_H */

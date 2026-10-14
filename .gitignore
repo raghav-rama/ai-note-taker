@@ -96,3 +96,6 @@ Desktop.ini
 
 # Claude Code worktrees
 .claude/
+
+# Superpowers SDD workspace (local ledger/scratch, not part of the repo)
+.superpowers/

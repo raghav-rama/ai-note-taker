@@ -60,9 +60,19 @@ jobs:
           chmod +x scripts/build-core.sh
           scripts/build-core.sh ${{ matrix.targets }}
 
+      # build.rs regenerates core/include/notetaker.h via cbindgen on every build.
+      # If the committed header has drifted from the current FFI surface, fail —
+      # the native apps (Swift/C#) decode against this header.
+      - name: Check FFI header is up to date
+        if: matrix.platform == 'linux'
+        run: git diff --exit-code core/include/notetaker.h
+
+      # cloud enables reqwest/rustls. Scope it to this native test build only:
+      # forcing it onto build-core.sh would also hit the Android cross-compile
+      # (ring) in this same job and could break the Linux core artifact.
       - name: Run core tests
         if: matrix.platform == 'linux'
-        run: cargo test -p notetaker-core
+        run: cargo test -p notetaker-core --features cloud
 
       - name: Upload core artifacts
         uses: actions/upload-artifact@v4
@@ -318,3 +328,12 @@ jobs:
 
       - name: Assert transcript content
         run: grep -i country transcript-out.txt
+
+      # Exercise the FFI push-audio path (note_start_recording_push + note_push_audio)
+      # with raw PCM, proving system-audio feed works end to end (P2-5 DoD).
+      - name: Transcribe fixture via FFI push-audio
+        shell: bash
+        run: cargo run --release -p notetaker-core --bin transcribe-wav -- --via-ffi samples/jfk.wav models/ggml-tiny.bin | tee transcript-ffi-out.txt
+
+      - name: Assert FFI transcript content
+        run: grep -i country transcript-ffi-out.txt

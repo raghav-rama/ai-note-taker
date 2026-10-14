@@ -61,6 +61,17 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     record_btn.add_css_class("suggested-action");
     record_btn.add_css_class("pill");
 
+    // ── Pause / Resume button ──────────────────────────────────────────
+
+    let pause_btn = gtk::Button::builder()
+        .label("Pause")
+        .halign(gtk::Align::Center)
+        .width_request(160)
+        .height_request(48)
+        .build();
+    pause_btn.add_css_class("pill");
+    pause_btn.set_sensitive(false);
+
     // ── Live transcript ────────────────────────────────────────────────
 
     let transcript_buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
@@ -89,6 +100,7 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     container.append(&timer_label);
     container.append(&level_bar);
     container.append(&record_btn);
+    container.append(&pause_btn);
     container.append(&scroll);
 
     let clamp = adw::Clamp::builder()
@@ -105,6 +117,7 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     // ── Recording state and logic ──────────────────────────────────────
 
     let is_recording = Arc::new(Cell::new(false));
+    let paused = Arc::new(Cell::new(false));
     let elapsed_secs = Arc::new(Cell::new(0u64));
 
     // Timer tick — updates the label and audio level every second while recording.
@@ -113,17 +126,24 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
         let level = level_bar.clone();
         let bridge_ref = bridge.clone();
         let recording = is_recording.clone();
+        let paused_t = paused.clone();
         let secs = elapsed_secs.clone();
 
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
             if recording.get() {
-                let s = secs.get() + 1;
-                secs.set(s);
-                let h = s / 3600;
-                let m = (s % 3600) / 60;
-                let sec = s % 60;
-                timer.set_label(&format!("{h:02}:{m:02}:{sec:02}"));
-                level.set_value(bridge_ref.audio_level() as f64);
+                if paused_t.get() {
+                    // While paused, don't advance the elapsed timer and show no
+                    // input level (the capture is stopped, so audio_level is stale).
+                    level.set_value(0.0);
+                } else {
+                    let s = secs.get() + 1;
+                    secs.set(s);
+                    let h = s / 3600;
+                    let m = (s % 3600) / 60;
+                    let sec = s % 60;
+                    timer.set_label(&format!("{h:02}:{m:02}:{sec:02}"));
+                    level.set_value(bridge_ref.audio_level() as f64);
+                }
             }
             glib::ControlFlow::Continue
         });
@@ -143,6 +163,44 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
         });
     }
 
+    // Pause/resume button handler.
+    {
+        let bridge_ref = bridge.clone();
+        let pause_b = pause_btn.clone();
+        let paused_c = paused.clone();
+
+        pause_btn.connect_clicked(move |_| {
+            let currently = paused_c.get();
+            let bridge_c = bridge_ref.clone();
+            let pause_bc = pause_b.clone();
+            let paused_cc = paused_c.clone();
+
+            glib::spawn_future_local(async move {
+                if !currently {
+                    match bridge_c.pause_recording().await {
+                        Ok(()) => {
+                            paused_cc.set(true);
+                            pause_bc.set_label("Resume");
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to pause recording: {e}");
+                        }
+                    }
+                } else {
+                    match bridge_c.resume_recording().await {
+                        Ok(()) => {
+                            paused_cc.set(false);
+                            pause_bc.set_label("Pause");
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to resume recording: {e}");
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     // Record/stop button handler.
     {
         let recording = is_recording;
@@ -152,6 +210,8 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
         let buf = transcript_buffer;
         let level = level_bar;
         let bridge_ref = bridge;
+        let pause_b = pause_btn;
+        let paused_r = paused;
 
         record_btn.connect_clicked(move |_| {
             let currently = recording.get();
@@ -161,6 +221,7 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                 let bridge_c = bridge_ref.clone();
                 let btn_c = btn.clone();
                 let rec_c = recording.clone();
+                let pause_sc = pause_b.clone();
 
                 glib::spawn_future_local(async move {
                     match bridge_c.start_recording(None).await {
@@ -169,6 +230,7 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                             btn_c.set_label("Stop");
                             btn_c.remove_css_class("suggested-action");
                             btn_c.add_css_class("destructive-action");
+                            pause_sc.set_sensitive(true);
                         }
                         Err(e) => {
                             eprintln!("Failed to start recording: {e}");
@@ -184,6 +246,8 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                 let timer_c = timer.clone();
                 let buf_c = buf.clone();
                 let level_c = level.clone();
+                let pause_stc = pause_b.clone();
+                let paused_stc = paused_r.clone();
 
                 glib::spawn_future_local(async move {
                     match bridge_c.stop_recording().await {
@@ -195,6 +259,9 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                             btn_c.add_css_class("suggested-action");
                             timer_c.set_label("00:00:00");
                             level_c.set_value(0.0);
+                            pause_stc.set_sensitive(false);
+                            pause_stc.set_label("Pause");
+                            paused_stc.set(false);
 
                             // Clear transcript buffer for next session.
                             let (start, end) = buf_c.bounds();

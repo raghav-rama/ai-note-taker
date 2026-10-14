@@ -196,6 +196,44 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
         .build();
     download_btn.add_css_class("pill");
 
+    // Download the selected model on click.
+    {
+        let bridge_ref = bridge.clone();
+        let btn = download_btn.clone();
+        let row = model_row.clone();
+        download_btn.connect_clicked(move |_| {
+            let name = match row.selected() {
+                0 => "tiny",
+                1 => "base",
+                2 => "small",
+                3 => "medium",
+                _ => "tiny",
+            }
+            .to_string();
+
+            btn.set_sensitive(false);
+            btn.set_label("Downloading…");
+
+            let bridge_c = bridge_ref.clone();
+            let btn_c = btn.clone();
+            glib::spawn_future_local(async move {
+                match bridge_c.download_model(&name).await {
+                    Ok(()) => {
+                        btn_c.set_label("Download complete");
+                        glib::timeout_future_seconds(2).await;
+                        btn_c.set_label("Download Selected Model");
+                        btn_c.set_sensitive(true);
+                    }
+                    Err(e) => {
+                        eprintln!("Model download failed: {e}");
+                        btn_c.set_label(&format!("Download failed: {e}"));
+                        btn_c.set_sensitive(true);
+                    }
+                }
+            });
+        });
+    }
+
     model_group.add(&model_row);
 
     // Load saved model selection.

@@ -293,18 +293,35 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
         let bridge_ref = bridge;
         let meeting_id = current_meeting_id;
 
-        export_btn.connect_clicked(move |_| {
+        export_btn.connect_clicked(move |btn| {
             let mid = *meeting_id.borrow();
             let Some(mid) = mid else {
                 return;
             };
 
             let bridge_c = bridge_ref.clone();
+            // Bind the toplevel window before moving into the async block so the
+            // save dialog can be parented to it.
+            let window = btn.root().and_downcast::<gtk::Window>();
             glib::spawn_future_local(async move {
                 match bridge_c.export_meeting(mid, "markdown").await {
                     Ok(content) => {
-                        eprintln!("Exported meeting {mid}:\n{content}");
-                        // TODO: save to file via GtkFileDialog
+                        // The save callback needs its own copy of the content.
+                        let content_bytes = content.into_bytes();
+                        let file_dialog = gtk::FileDialog::builder()
+                            .initial_name("meeting.md")
+                            .build();
+                        file_dialog.save(
+                            window.as_ref(),
+                            gio::Cancellable::NONE,
+                            move |res| {
+                                if let Ok(file) = res {
+                                    if let Some(path) = file.path() {
+                                        let _ = std::fs::write(path, content_bytes);
+                                    }
+                                }
+                            },
+                        );
                     }
                     Err(e) => {
                         eprintln!("Export failed: {e}");

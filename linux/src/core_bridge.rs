@@ -6,7 +6,9 @@
 use notetaker::audio::{self, AudioCapture, AudioLevelCallback};
 use notetaker::models::{AudioDevice, Meeting, TranscriptSegment};
 use notetaker::storage::Database;
-use notetaker::transcribe::{LocalTranscriber, TranscriptCallback};
+use notetaker::transcribe::{
+    self, LocalTranscriber, TranscriberConfig, TranscriptCallback, WhisperContext,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -19,6 +21,8 @@ pub struct CoreBridge {
     current_meeting_id: Arc<Mutex<Option<i64>>>,
     audio_level: Arc<Mutex<f32>>,
     transcript_tx: Arc<Mutex<Option<async_channel::Sender<TranscriptSegment>>>>,
+    /// Whisper context cached by resolved model-file path so the model loads once.
+    whisper_ctx: Arc<Mutex<Option<(String, Arc<WhisperContext>)>>>,
     recording: Arc<AtomicBool>,
     rt: Handle,
 }
@@ -34,6 +38,7 @@ impl CoreBridge {
             current_meeting_id: Arc::new(Mutex::new(None)),
             audio_level: Arc::new(Mutex::new(0.0)),
             transcript_tx: Arc::new(Mutex::new(None)),
+            whisper_ctx: Arc::new(Mutex::new(None)),
             recording: Arc::new(AtomicBool::new(false)),
             rt,
         })
@@ -60,6 +65,7 @@ impl CoreBridge {
         let level = self.audio_level.clone();
         let transcript_tx = self.transcript_tx.clone();
         let model_dir = self.model_path.clone();
+        let whisper_ctx = self.whisper_ctx.clone();
 
         let outcome = self
             .rt
@@ -100,8 +106,41 @@ impl CoreBridge {
                         .unwrap_or_else(|| "tiny".to_string());
                     let model_file = format!("{model_dir}/ggml-{model_name}.bin");
 
+                    // Load the model once and cache it by path; later recordings
+                    // reuse the context instead of reloading (seconds of work).
+                    let ctx = {
+                        let mut cache = whisper_ctx.lock().unwrap();
+                        match cache.as_ref() {
+                            Some((p, c)) if p == &model_file => c.clone(),
+                            _ => {
+                                let c = transcribe::load_context(&model_file)
+                                    .map_err(|e| e.to_string())?;
+                                *cache = Some((model_file.clone(), c.clone()));
+                                c
+                            }
+                        }
+                    };
+
+                    // Transcription parameters from settings.
+                    let language = db
+                        .get_setting("whisper_language")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "en".to_string());
+                    let n_threads = db
+                        .get_setting("whisper_threads")
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or(4);
+                    let config = TranscriberConfig { language, n_threads };
+
                     let transcriber = LocalTranscriber::new(
-                        &model_file,
+                        ctx,
+                        config,
                         audio_rx,
                         db.clone(),
                         meeting_id,
@@ -223,6 +262,20 @@ impl CoreBridge {
             .map_err(|e| e.to_string())?
     }
 
+    pub async fn resume_recording(&self) -> Result<(), String> {
+        let capture_slot = self.capture.clone();
+        self.rt
+            .spawn_blocking(move || {
+                if let Some(ref cap) = *capture_slot.lock().unwrap() {
+                    cap.resume().map_err(|e| e.to_string())
+                } else {
+                    Err("No active recording".to_string())
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
     pub fn audio_level(&self) -> f32 {
         *self.audio_level.lock().unwrap()
     }
@@ -240,8 +293,12 @@ impl CoreBridge {
 
     // ── Meetings / Storage ─────────────────────────────────────────────
 
+    /// Generate an AI summary for a meeting via the Anthropic API, persist both
+    /// the structured fields and a formatted narrative, and return the narrative
+    /// (with markdown section headers the Notes view parses).
     pub async fn summarize(&self, meeting_id: i64) -> Result<String, String> {
         let db = self.db.clone();
+        let rt = self.rt.clone();
         self.rt
             .spawn_blocking(move || {
                 let segments = db.get_segments(meeting_id).map_err(|e| e.to_string())?;
@@ -250,15 +307,93 @@ impl CoreBridge {
                     .map(|s| s.text.as_str())
                     .collect::<Vec<_>>()
                     .join(" ");
-                if transcript.is_empty() {
-                    Ok("No transcript available to summarize.".to_string())
-                } else {
-                    Ok(format!(
-                        "Transcript ({} segments, {} chars). Cloud summarization requires an API key — configure one in Settings.",
-                        segments.len(),
-                        transcript.len()
-                    ))
+                if transcript.trim().is_empty() {
+                    return Err("No transcript available to summarize.".to_string());
                 }
+
+                let api_key = db
+                    .get_setting("anthropic_api_key")
+                    .map_err(|e| e.to_string())?
+                    .filter(|k| !k.trim().is_empty())
+                    .ok_or_else(|| {
+                        "No Anthropic API key configured. Add one in Settings.".to_string()
+                    })?;
+                let model = db.get_setting("anthropic_model").ok().flatten();
+
+                use notetaker::summarize::Summarizer;
+                let summarizer = notetaker::summarize::CloudSummarizer::new(api_key, model, rt);
+                let summary = summarizer.summarize(&transcript).map_err(|e| e.to_string())?;
+
+                let formatted = format_summary(&summary);
+                // Persist the structured row and the formatted narrative (shown on
+                // reload and parsed into sections by the Notes view).
+                db.update_meeting_summary(meeting_id, &formatted)
+                    .map_err(|e| e.to_string())?;
+                db.upsert_summary(meeting_id, &summary)
+                    .map_err(|e| e.to_string())?;
+                Ok(formatted)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    /// Search meetings by transcript text (FTS5), newest first.
+    pub async fn search_meetings(&self, query: &str) -> Result<Vec<Meeting>, String> {
+        let query = query.to_owned();
+        let db = self.db.clone();
+        self.rt
+            .spawn_blocking(move || db.search_meetings_full(&query).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    /// Download a Whisper model (`tiny`/`base`/`small`/`medium`) from Hugging Face
+    /// into the models directory, writing atomically via a `.part` temp file.
+    pub async fn download_model(&self, model_name: &str) -> Result<(), String> {
+        let model_name = model_name.to_owned();
+        let model_dir = self.model_path.clone();
+        let ctx_cache = self.whisper_ctx.clone();
+        self.rt
+            .spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let url = format!(
+                    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model_name}.bin"
+                );
+                let dir = std::path::PathBuf::from(&model_dir);
+                tokio::fs::create_dir_all(&dir)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let dest = dir.join(format!("ggml-{model_name}.bin"));
+                let tmp = dir.join(format!("ggml-{model_name}.bin.part"));
+
+                let mut resp = reqwest::get(url).await.map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("Download failed: HTTP {}", resp.status()));
+                }
+                // Stream to disk so a large model (medium ~1.5GB) is never fully
+                // buffered in RAM, and the writes are async (not a blocking fs call
+                // parking a runtime worker).
+                let mut file = tokio::fs::File::create(&tmp)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+                    file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                }
+                file.flush().await.map_err(|e| e.to_string())?;
+                drop(file);
+                tokio::fs::rename(&tmp, &dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Invalidate a cached context for this path so the freshly
+                // downloaded model is loaded next time, not the stale Arc.
+                let dest_str = dest.to_string_lossy().into_owned();
+                if let Ok(mut cache) = ctx_cache.lock() {
+                    if cache.as_ref().map(|(p, _)| p == &dest_str).unwrap_or(false) {
+                        *cache = None;
+                    }
+                }
+                Ok::<(), String>(())
             })
             .await
             .map_err(|e| e.to_string())?
@@ -341,4 +476,30 @@ impl CoreBridge {
             .await
             .map_err(|e| e.to_string())?
     }
+}
+
+/// Format a structured summary into markdown with section headers the Notes view
+/// parses (`## Key Points`, `## Action Items`, `## Decisions`).
+fn format_summary(s: &notetaker::models::Summary) -> String {
+    let mut out = String::new();
+    out.push_str(&s.summary);
+    if !s.key_points.is_empty() {
+        out.push_str("\n\n## Key Points\n");
+        for p in &s.key_points {
+            out.push_str(&format!("- {p}\n"));
+        }
+    }
+    if !s.action_items.is_empty() {
+        out.push_str("\n## Action Items\n");
+        for p in &s.action_items {
+            out.push_str(&format!("- {p}\n"));
+        }
+    }
+    if !s.decisions.is_empty() {
+        out.push_str("\n## Decisions\n");
+        for p in &s.decisions {
+            out.push_str(&format!("- {p}\n"));
+        }
+    }
+    out
 }

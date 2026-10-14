@@ -1,5 +1,7 @@
 use adw::prelude::*;
 use gtk::glib;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::core_bridge::CoreBridge;
@@ -68,27 +70,39 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     {
         let list = list_box.clone();
         let bridge_ref = bridge.clone();
+        // Monotonic token bumped per load; a result whose token is stale (a later
+        // keystroke superseded it) is discarded, so fast typing can't interleave
+        // out-of-order results or clear the list for a query no longer in the box.
+        let load_gen = Rc::new(Cell::new(0u64));
 
         let load_meetings = move |search_text: String| {
             let list_c = list.clone();
             let bridge_c = bridge_ref.clone();
+            let gen_c = load_gen.clone();
+            let my_gen = load_gen.get().wrapping_add(1);
+            load_gen.set(my_gen);
 
             glib::spawn_future_local(async move {
-                // Remove all existing rows.
+                // Non-empty query → real FTS5 search; empty → list all.
+                let result = if search_text.trim().is_empty() {
+                    bridge_c.list_meetings(50, 0).await
+                } else {
+                    bridge_c.search_meetings(&search_text).await
+                };
+
+                // A newer load superseded this one — discard without touching the list.
+                if gen_c.get() != my_gen {
+                    return;
+                }
+
+                // Clear and repopulate only for the latest query.
                 while let Some(child) = list_c.first_child() {
                     list_c.remove(&child);
                 }
 
-                match bridge_c.list_meetings(50, 0).await {
+                match result {
                     Ok(meetings) => {
-                        let needle = search_text.to_lowercase();
                         for meeting in meetings {
-                            // Client-side search filter.
-                            if !needle.is_empty() && !meeting.title.to_lowercase().contains(&needle)
-                            {
-                                continue;
-                            }
-
                             let duration_str = meeting
                                 .duration_secs
                                 .map(|s| {

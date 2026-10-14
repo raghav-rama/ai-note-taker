@@ -1,7 +1,14 @@
 //! Transcription module using whisper-rs (whisper.cpp bindings).
 //!
-//! Processes audio in streaming chunks of 3-5 seconds, runs inference
-//! via a local Whisper model, and delivers results through a callback.
+//! Audio arrives as resampled 16kHz mono f32 and is accumulated into overlapping
+//! windows, run through a single long-lived Whisper inference state (so decoder
+//! context carries across windows), and delivered through a callback.
+//!
+//! The quality-sensitive buffering logic — window sizing, overlap, the 30s memory
+//! cap, energy-based silence detection, and timestamp-based de-duplication of the
+//! re-transcribed overlap region — lives in small whisper-free helpers
+//! ([`AudioChunker`], [`SegmentDeduper`], [`rms`]) so it can be unit-tested
+//! without a model.
 
 use anyhow::Result;
 use log::{error, info, warn};
@@ -9,16 +16,52 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContextParameters};
+// Re-exported so FFI consumers (e.g. the Linux bridge) can name the cached
+// context type without depending on whisper-rs directly.
+pub use whisper_rs::WhisperContext;
 
 use crate::storage::Database;
 
-/// Minimum audio duration in samples at 16kHz to avoid whisper.cpp errors.
-/// Whisper requires at least ~1 second of audio.
-const MIN_SAMPLES: usize = 16000;
+/// Sample rate of the audio fed to the transcriber (Whisper's native rate).
+/// Private so cbindgen does not export it into the C header as a `#define`.
+const SAMPLE_RATE: usize = 16000;
 
-/// Target chunk size in samples at 16kHz (~4 seconds).
-const CHUNK_SIZE: usize = 16000 * 4;
+/// Target window size in samples (~4 seconds).
+const CHUNK_SIZE: usize = SAMPLE_RATE * 4;
+
+/// Overlap retained between consecutive windows (~1 second), so a word split
+/// across a window boundary is seen whole in the next window.
+const OVERLAP_SIZE: usize = SAMPLE_RATE;
+
+/// Minimum samples to hand to whisper.cpp (it needs ~1 second).
+const MIN_SAMPLES: usize = SAMPLE_RATE;
+
+/// Hard cap on the internal buffer (~30 seconds). If inference falls behind
+/// real time, the oldest audio is dropped rather than growing without bound.
+const MAX_BUFFER: usize = SAMPLE_RATE * 30;
+
+/// RMS level below which a window is treated as silence and skipped (no
+/// inference). Kept low so quiet speech is not discarded.
+const SILENCE_RMS: f32 = 0.008;
+
+/// Transcription parameters read from settings by the caller.
+#[derive(Debug, Clone)]
+pub struct TranscriberConfig {
+    /// Whisper language code (e.g. "en"), or "auto" for auto-detection.
+    pub language: String,
+    /// Number of inference threads.
+    pub n_threads: i32,
+}
+
+impl Default for TranscriberConfig {
+    fn default() -> Self {
+        Self {
+            language: "en".to_string(),
+            n_threads: 4,
+        }
+    }
+}
 
 /// A transcribed segment before database insertion.
 #[derive(Debug, Clone)]
@@ -35,266 +78,199 @@ pub struct RawSegment {
 /// Parameters: text, timestamp in seconds.
 pub type TranscriptCallback = Box<dyn Fn(&str, f64) + Send + 'static>;
 
+/// Load a Whisper model into a reference-counted context.
+///
+/// Callers cache the returned context so the (multi-second) load happens once per
+/// model rather than on every recording start.
+pub fn load_context(model_path: &str) -> Result<Arc<WhisperContext>> {
+    let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::new())
+        .map_err(|e| anyhow::anyhow!("Failed to load Whisper model from {}: {:?}", model_path, e))?;
+    info!("Whisper model loaded from {}", model_path);
+    Ok(Arc::new(ctx))
+}
+
+/// Root-mean-square level of a buffer of samples (0.0 for empty input).
+pub(crate) fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Accumulates incoming audio and yields fixed-size, overlapping windows while
+/// capping total buffered memory. Whisper-free so it is unit-testable.
+pub(crate) struct AudioChunker {
+    buffer: Vec<f32>,
+    chunk_size: usize,
+    overlap: usize,
+    max_buffer: usize,
+    /// Absolute sample index (from stream start) of `buffer[0]`.
+    base_pos: usize,
+}
+
+impl AudioChunker {
+    fn new(chunk_size: usize, overlap: usize, max_buffer: usize) -> Self {
+        debug_assert!(overlap < chunk_size);
+        debug_assert!(max_buffer >= chunk_size);
+        Self {
+            buffer: Vec::with_capacity(chunk_size * 2),
+            chunk_size,
+            overlap,
+            max_buffer,
+            base_pos: 0,
+        }
+    }
+
+    /// Append samples. If the buffer would exceed `max_buffer`, the oldest
+    /// samples are dropped (advancing the absolute base position) so memory is
+    /// bounded even when inference cannot keep up.
+    fn push(&mut self, samples: &[f32]) {
+        self.buffer.extend_from_slice(samples);
+        if self.buffer.len() > self.max_buffer {
+            let drop = self.buffer.len() - self.max_buffer;
+            self.buffer.drain(..drop);
+            self.base_pos += drop;
+        }
+    }
+
+    /// If a full window is available, return `(absolute_offset_samples, window)`
+    /// and advance by `chunk_size - overlap`, retaining the overlap tail for the
+    /// next window.
+    fn next_window(&mut self) -> Option<(usize, Vec<f32>)> {
+        if self.buffer.len() < self.chunk_size {
+            return None;
+        }
+        let window = self.buffer[..self.chunk_size].to_vec();
+        let offset = self.base_pos;
+        let advance = self.chunk_size - self.overlap;
+        self.buffer.drain(..advance);
+        self.base_pos += advance;
+        Some((offset, window))
+    }
+
+    /// Drain whatever remains as a final window (the real, unpadded tail), or
+    /// `None` if the buffer is empty. Used at shutdown so trailing audio is not
+    /// lost. Padding to whisper's minimum happens in `transcribe_window` AFTER the
+    /// silence check, so a short tail isn't diluted below the VAD threshold.
+    fn flush(&mut self) -> Option<(usize, Vec<f32>)> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let offset = self.base_pos;
+        let window = std::mem::take(&mut self.buffer);
+        self.base_pos += window.len();
+        Some((offset, window))
+    }
+}
+
+/// Drops segments whose audio was already emitted by a previous (overlapping)
+/// window, keyed on absolute millisecond timestamps. Whisper-free, unit-testable.
+pub(crate) struct SegmentDeduper {
+    /// Absolute end (ms) of the most recently emitted audio; -1 before anything.
+    emitted_until_ms: i64,
+}
+
+impl SegmentDeduper {
+    fn new() -> Self {
+        Self {
+            emitted_until_ms: -1,
+        }
+    }
+
+    /// Returns true if a segment spanning `[start_ms, end_ms)` should be emitted.
+    ///
+    /// Drop ONLY segments that end at or before the already-emitted boundary —
+    /// i.e. lie entirely within audio a previous overlapping window already
+    /// transcribed. A segment that *straddles* the boundary (`start < emitted <
+    /// end`) carries never-emitted speech in `[emitted, end)`, so it must be kept:
+    /// dropping it whole (the previous behavior, keyed on `start_ms`) silently
+    /// lost that tail and, for one-segment-per-window speech, every seam window,
+    /// up to ~50% of a continuous transcript. Keeping it duplicates a little
+    /// overlap text, which is the correct trade.
+    fn accept(&mut self, _start_ms: i64, end_ms: i64) -> bool {
+        if end_ms <= self.emitted_until_ms {
+            return false;
+        }
+        self.emitted_until_ms = self.emitted_until_ms.max(end_ms);
+        true
+    }
+}
+
 /// Local transcription engine using whisper.cpp.
 pub struct LocalTranscriber {
     /// Handle to the transcription worker thread.
     thread_handle: Option<thread::JoinHandle<()>>,
-    /// Send a `None` to signal shutdown.
+    /// Send a `()` to signal shutdown.
     shutdown_tx: mpsc::Sender<()>,
 }
 
 impl LocalTranscriber {
     /// Start a transcription worker that reads audio chunks from `audio_rx`.
     ///
-    /// - `model_path`: path to a Whisper GGML model file.
+    /// - `ctx`: a preloaded Whisper context (see [`load_context`]); shared so the
+    ///   model is not reloaded per recording.
+    /// - `config`: language and thread settings.
     /// - `audio_rx`: receiver of resampled 16kHz mono f32 audio chunks.
     /// - `db`: shared database handle for persisting segments.
     /// - `meeting_id`: the current meeting being recorded.
     /// - `callback`: invoked with each transcribed segment's text and timestamp (seconds).
     ///
-    /// The model is loaded synchronously before returning. If the model file
-    /// is missing or corrupt, this returns an error immediately.
+    /// Returns once the worker has successfully created its inference state, so a
+    /// failure to do so is reported to the caller immediately.
     pub fn new(
-        model_path: &str,
+        ctx: Arc<WhisperContext>,
+        config: TranscriberConfig,
         audio_rx: mpsc::Receiver<Vec<f32>>,
         db: Arc<Database>,
         meeting_id: i64,
         callback: Option<TranscriptCallback>,
     ) -> Result<Self> {
-        let model_path = model_path.to_string();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        // The worker reports whether it created its inference state so the caller
+        // gets an immediate error instead of a silently dead transcriber.
+        let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
 
-        // Channel for the worker thread to report whether model loading succeeded.
-        let (load_tx, load_rx) = mpsc::channel::<std::result::Result<(), String>>();
-
-        // Load the Whisper model on the worker thread (can be large).
         let thread_handle = thread::spawn(move || {
-            let ctx = match WhisperContext::new_with_params(
-                &model_path,
-                WhisperContextParameters::new(),
-            ) {
-                Ok(ctx) => {
-                    let _ = load_tx.send(Ok(()));
-                    ctx
+            // `ctx` is owned by this closure for the thread's lifetime; `state`
+            // (created from it) is dropped first at scope end.
+            let mut state = match ctx.create_state() {
+                Ok(s) => {
+                    let _ = ready_tx.send(Ok(()));
+                    s
                 }
                 Err(e) => {
-                    let msg = format!("Failed to load Whisper model from {}: {:?}", model_path, e);
+                    let msg = format!("Failed to create Whisper state: {:?}", e);
                     error!("{}", msg);
-                    let _ = load_tx.send(Err(msg));
+                    let _ = ready_tx.send(Err(msg));
                     return;
                 }
             };
 
-            info!("Whisper model loaded from {}", model_path);
-
-            let mut buffer: Vec<f32> = Vec::with_capacity(CHUNK_SIZE * 2);
-            let mut total_samples_processed: usize = 0;
-
-            loop {
-                // Check for shutdown.
-                if shutdown_rx.try_recv().is_ok() {
-                    // Drain audio still queued in the channel: a shutdown signal
-                    // can arrive before recv_timeout has consumed the backlog, so
-                    // flushing only `buffer` would drop trailing audio.
-                    while let Ok(chunk) = audio_rx.try_recv() {
-                        buffer.extend_from_slice(&chunk);
-                        while buffer.len() >= CHUNK_SIZE {
-                            let block: Vec<f32> = buffer.drain(..CHUNK_SIZE).collect();
-                            Self::transcribe_chunk(
-                                &ctx,
-                                &block,
-                                total_samples_processed,
-                                &db,
-                                meeting_id,
-                                &callback,
-                            );
-                            total_samples_processed += CHUNK_SIZE;
-                        }
-                    }
-                    // Process any remaining audio in the buffer, padding if needed.
-                    if !buffer.is_empty() {
-                        if buffer.len() < MIN_SAMPLES {
-                            buffer.resize(MIN_SAMPLES, 0.0);
-                        }
-                        Self::transcribe_chunk(
-                            &ctx,
-                            &buffer,
-                            total_samples_processed,
-                            &db,
-                            meeting_id,
-                            &callback,
-                        );
-                    }
-                    info!("Transcriber shutting down");
-                    return;
-                }
-
-                // Collect audio chunks.
-                match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(chunk) => {
-                        buffer.extend_from_slice(&chunk);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // No data yet, keep waiting.
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        // Audio source closed. Process remaining buffer, padding
-                        // to MIN_SAMPLES if needed (whisper.cpp needs >= 1s).
-                        if !buffer.is_empty() {
-                            if buffer.len() < MIN_SAMPLES {
-                                buffer.resize(MIN_SAMPLES, 0.0);
-                            }
-                            Self::transcribe_chunk(
-                                &ctx,
-                                &buffer,
-                                total_samples_processed,
-                                &db,
-                                meeting_id,
-                                &callback,
-                            );
-                        }
-                        info!("Audio channel closed, transcriber exiting");
-                        return;
-                    }
-                }
-
-                // Process when we have enough audio.
-                if buffer.len() >= CHUNK_SIZE {
-                    let chunk: Vec<f32> = buffer.drain(..CHUNK_SIZE).collect();
-                    Self::transcribe_chunk(
-                        &ctx,
-                        &chunk,
-                        total_samples_processed,
-                        &db,
-                        meeting_id,
-                        &callback,
-                    );
-                    total_samples_processed += CHUNK_SIZE;
-                }
-            }
+            run_worker(
+                &mut state,
+                &config,
+                audio_rx,
+                shutdown_rx,
+                &db,
+                meeting_id,
+                &callback,
+            );
         });
 
-        // Wait for the model to load before returning. This ensures callers
-        // get an immediate error if the model file is missing or corrupt.
-        match load_rx.recv() {
-            Ok(Ok(())) => {}
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                thread_handle: Some(thread_handle),
+                shutdown_tx,
+            }),
             Ok(Err(msg)) => {
-                // Thread will exit on its own since it already returned.
                 let _ = thread_handle.join();
-                return Err(anyhow::anyhow!("{}", msg));
+                Err(anyhow::anyhow!("{}", msg))
             }
             Err(_) => {
-                // Thread panicked or exited before sending.
                 let _ = thread_handle.join();
-                return Err(anyhow::anyhow!("Transcriber thread exited unexpectedly"));
+                Err(anyhow::anyhow!("Transcriber thread exited unexpectedly"))
             }
-        }
-
-        Ok(Self {
-            thread_handle: Some(thread_handle),
-            shutdown_tx,
-        })
-    }
-
-    /// Run Whisper inference on a single audio chunk.
-    fn transcribe_chunk(
-        ctx: &WhisperContext,
-        audio: &[f32],
-        samples_offset: usize,
-        db: &Database,
-        meeting_id: i64,
-        callback: &Option<TranscriptCallback>,
-    ) {
-        let mut state = match ctx.create_state() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to create Whisper state: {:?}", e);
-                return;
-            }
-        };
-
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_n_threads(4);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_special(false);
-        params.set_print_timestamps(false);
-        params.set_single_segment(false);
-        params.set_no_context(true);
-        params.set_token_timestamps(true);
-
-        if let Err(e) = state.full(params, audio) {
-            error!("Whisper inference failed: {:?}", e);
-            return;
-        }
-
-        let n_segments = match state.full_n_segments() {
-            Ok(n) => n,
-            Err(e) => {
-                error!("Failed to get segment count: {:?}", e);
-                return;
-            }
-        };
-
-        for i in 0..n_segments {
-            let text = match state.full_get_segment_text(i) {
-                Ok(t) => t.trim().to_string(),
-                Err(e) => {
-                    warn!("Failed to get segment {} text: {:?}", i, e);
-                    continue;
-                }
-            };
-
-            if text.is_empty() {
-                continue;
-            }
-
-            // Whisper timestamps are in centiseconds (10ms units).
-            let t0_cs = state.full_get_segment_t0(i).unwrap_or(0);
-            // Convert to absolute milliseconds.
-            let offset_ms = (samples_offset as i64 * 1000) / 16000;
-            let timestamp_ms = offset_ms + t0_cs * 10;
-
-            // Compute average token probability as confidence.
-            let confidence = Self::compute_segment_confidence(&state, i);
-
-            // Persist to database.
-            if let Err(e) = db.insert_segment(meeting_id, timestamp_ms, &text, confidence) {
-                error!("Failed to save transcript segment: {}", e);
-            }
-
-            // Invoke callback.
-            if let Some(ref cb) = callback {
-                let timestamp_secs = timestamp_ms as f64 / 1000.0;
-                cb(&text, timestamp_secs);
-            }
-        }
-    }
-
-    /// Compute the average token probability for a segment as a confidence score.
-    fn compute_segment_confidence(
-        state: &whisper_rs::WhisperState,
-        segment: std::ffi::c_int,
-    ) -> Option<f64> {
-        let n_tokens = match state.full_n_tokens(segment) {
-            Ok(n) if n > 0 => n,
-            _ => return None,
-        };
-
-        let mut sum = 0.0f64;
-        let mut count = 0;
-        for t in 0..n_tokens {
-            if let Ok(prob) = state.full_get_token_prob(segment, t) {
-                sum += prob as f64;
-                count += 1;
-            }
-        }
-
-        if count > 0 {
-            Some(sum / count as f64)
-        } else {
-            None
         }
     }
 
@@ -313,5 +289,296 @@ impl Drop for LocalTranscriber {
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+/// The worker loop: accumulate audio into overlapping windows and transcribe
+/// each through the shared `state`.
+#[allow(clippy::too_many_arguments)]
+fn run_worker(
+    state: &mut whisper_rs::WhisperState,
+    config: &TranscriberConfig,
+    audio_rx: mpsc::Receiver<Vec<f32>>,
+    shutdown_rx: mpsc::Receiver<()>,
+    db: &Database,
+    meeting_id: i64,
+    callback: &Option<TranscriptCallback>,
+) {
+    let mut chunker = AudioChunker::new(CHUNK_SIZE, OVERLAP_SIZE, MAX_BUFFER);
+    let mut deduper = SegmentDeduper::new();
+
+    let drain_windows =
+        |chunker: &mut AudioChunker, state: &mut whisper_rs::WhisperState, deduper: &mut SegmentDeduper| {
+            while let Some((offset, window)) = chunker.next_window() {
+                transcribe_window(state, config, &window, offset, deduper, db, meeting_id, callback);
+            }
+        };
+
+    loop {
+        // Shutdown: drain anything still queued, flush the tail, and exit.
+        if shutdown_rx.try_recv().is_ok() {
+            while let Ok(chunk) = audio_rx.try_recv() {
+                chunker.push(&chunk);
+                drain_windows(&mut chunker, state, &mut deduper);
+            }
+            if let Some((offset, window)) = chunker.flush() {
+                transcribe_window(
+                    state, config, &window, offset, &mut deduper, db, meeting_id, callback,
+                );
+            }
+            info!("Transcriber shutting down");
+            return;
+        }
+
+        match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(chunk) => {
+                chunker.push(&chunk);
+                // Pull in any further already-queued audio so backlog lives in the
+                // chunker (which the 30s cap bounds, dropping oldest) rather than
+                // growing unbounded in the channel when inference falls behind.
+                while let Ok(more) = audio_rx.try_recv() {
+                    chunker.push(&more);
+                }
+                drain_windows(&mut chunker, state, &mut deduper);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Audio source closed: flush the remaining buffer and exit.
+                if let Some((offset, window)) = chunker.flush() {
+                    transcribe_window(
+                        state, config, &window, offset, &mut deduper, db, meeting_id, callback,
+                    );
+                }
+                info!("Audio channel closed, transcriber exiting");
+                return;
+            }
+        }
+    }
+}
+
+/// Run Whisper inference on a single window and persist/emit its (de-duplicated)
+/// segments. Silent windows are skipped without running inference.
+#[allow(clippy::too_many_arguments)]
+fn transcribe_window(
+    state: &mut whisper_rs::WhisperState,
+    config: &TranscriberConfig,
+    audio: &[f32],
+    offset_samples: usize,
+    deduper: &mut SegmentDeduper,
+    db: &Database,
+    meeting_id: i64,
+    callback: &Option<TranscriptCallback>,
+) {
+    // Skip inference on near-silent audio (saves CPU and avoids hallucinated
+    // text). Check RMS on the real audio BEFORE padding so a short flush tail is
+    // not diluted below the threshold by trailing zeros.
+    if rms(audio) < SILENCE_RMS {
+        return;
+    }
+
+    // whisper.cpp needs ~1s of samples; pad only a short (final flush) window
+    // with silence. Full windows from next_window() are already CHUNK_SIZE.
+    let mut padded_buf;
+    let audio: &[f32] = if audio.len() < MIN_SAMPLES {
+        padded_buf = audio.to_vec();
+        padded_buf.resize(MIN_SAMPLES, 0.0);
+        &padded_buf
+    } else {
+        audio
+    };
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_n_threads(config.n_threads);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_special(false);
+    params.set_print_timestamps(false);
+    params.set_single_segment(false);
+    // Carry decoder context across windows (the state is reused per session).
+    params.set_no_context(false);
+    params.set_token_timestamps(true);
+    // "auto" (or empty) lets whisper.cpp detect the language; otherwise force it.
+    if !config.language.is_empty() && config.language != "auto" {
+        params.set_language(Some(config.language.as_str()));
+    }
+
+    if let Err(e) = state.full(params, audio) {
+        error!("Whisper inference failed: {:?}", e);
+        return;
+    }
+
+    let n_segments = match state.full_n_segments() {
+        Ok(n) => n,
+        Err(e) => {
+            error!("Failed to get segment count: {:?}", e);
+            return;
+        }
+    };
+
+    let offset_ms = (offset_samples as i64 * 1000) / SAMPLE_RATE as i64;
+
+    for i in 0..n_segments {
+        let text = match state.full_get_segment_text(i) {
+            Ok(t) => t.trim().to_string(),
+            Err(e) => {
+                warn!("Failed to get segment {} text: {:?}", i, e);
+                continue;
+            }
+        };
+        if text.is_empty() {
+            continue;
+        }
+
+        // Whisper timestamps are centiseconds (10ms) relative to this window.
+        let t0_cs = state.full_get_segment_t0(i).unwrap_or(0);
+        let t1_cs = state.full_get_segment_t1(i).unwrap_or(t0_cs);
+        let start_ms = offset_ms + t0_cs * 10;
+        let end_ms = offset_ms + t1_cs * 10;
+
+        // Drop segments re-transcribed from the overlap of a previous window.
+        if !deduper.accept(start_ms, end_ms) {
+            continue;
+        }
+
+        let confidence = compute_segment_confidence(state, i);
+
+        if let Err(e) = db.insert_segment(meeting_id, start_ms, &text, confidence) {
+            error!("Failed to save transcript segment: {}", e);
+        }
+
+        if let Some(cb) = callback {
+            cb(&text, start_ms as f64 / 1000.0);
+        }
+    }
+}
+
+/// Compute the average token probability for a segment as a confidence score.
+fn compute_segment_confidence(
+    state: &whisper_rs::WhisperState,
+    segment: std::ffi::c_int,
+) -> Option<f64> {
+    let n_tokens = match state.full_n_tokens(segment) {
+        Ok(n) if n > 0 => n,
+        _ => return None,
+    };
+
+    let mut sum = 0.0f64;
+    let mut count = 0;
+    for t in 0..n_tokens {
+        if let Ok(prob) = state.full_get_token_prob(segment, t) {
+            sum += prob as f64;
+            count += 1;
+        }
+    }
+
+    if count > 0 {
+        Some(sum / count as f64)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rms_of_silence_is_zero() {
+        assert_eq!(rms(&[]), 0.0);
+        assert_eq!(rms(&[0.0; 100]), 0.0);
+    }
+
+    #[test]
+    fn rms_of_full_scale_is_one() {
+        let s = vec![1.0f32; 50];
+        assert!((rms(&s) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chunker_emits_full_windows_with_overlap_offsets() {
+        // chunk 10, overlap 4 → advance 6 per window.
+        let mut c = AudioChunker::new(10, 4, 1000);
+        c.push(&vec![1.0; 10]);
+        let (off0, w0) = c.next_window().expect("first window");
+        assert_eq!(off0, 0);
+        assert_eq!(w0.len(), 10);
+        // Only 4 (overlap) remain; not enough for another window yet.
+        assert!(c.next_window().is_none());
+
+        // Add 6 more → 10 buffered again; next window starts at advance=6.
+        c.push(&vec![1.0; 6]);
+        let (off1, w1) = c.next_window().expect("second window");
+        assert_eq!(off1, 6);
+        assert_eq!(w1.len(), 10);
+    }
+
+    #[test]
+    fn chunker_caps_memory_and_advances_base() {
+        // max_buffer 20; pushing 30 drops the oldest 10.
+        let mut c = AudioChunker::new(10, 4, 20);
+        c.push(&vec![0.5; 30]);
+        // base_pos advanced by the dropped amount (10); a window now starts there.
+        let (off, w) = c.next_window().expect("window after cap");
+        assert_eq!(off, 10);
+        assert_eq!(w.len(), 10);
+    }
+
+    #[test]
+    fn chunker_flush_returns_real_tail_unpadded() {
+        let mut c = AudioChunker::new(10, 4, 100);
+        c.push(&vec![0.3; 3]);
+        assert!(c.next_window().is_none());
+        let (off, w) = c.flush().expect("flush tail");
+        assert_eq!(off, 0);
+        // Real tail, not padded — padding to the whisper minimum happens in
+        // transcribe_window after the silence check.
+        assert_eq!(w.len(), 3);
+    }
+
+    #[test]
+    fn chunker_flush_empty_is_none() {
+        let mut c = AudioChunker::new(10, 4, 100);
+        assert!(c.flush().is_none());
+    }
+
+    #[test]
+    fn deduper_drops_overlap_resegments_keeps_new() {
+        let mut d = SegmentDeduper::new();
+        // First window emits [0,2000) and [2000,4000).
+        assert!(d.accept(0, 2000));
+        assert!(d.accept(2000, 4000));
+        // Next (overlapping) window re-transcribes [3000,4000) → dropped.
+        assert!(!d.accept(3000, 4000));
+        // Genuinely new audio past the emitted point is kept.
+        assert!(d.accept(4000, 6000));
+        // A late/again-overlapping segment is dropped.
+        assert!(!d.accept(5000, 6000));
+    }
+
+    #[test]
+    fn deduper_accepts_first_segment_at_zero() {
+        let mut d = SegmentDeduper::new();
+        assert!(d.accept(0, 500));
+    }
+
+    #[test]
+    fn deduper_keeps_straddling_segment_with_new_tail() {
+        // Regression for the ~50% transcript-loss bug: a seam window re-transcribes
+        // the 1s overlap AND carries new speech past the boundary. It must be kept.
+        let mut d = SegmentDeduper::new();
+        assert!(d.accept(0, 4000)); // emitted_until = 4000
+        // Straddles 4000 (new audio in [4000,7000)) → keep (old start_ms rule dropped this).
+        assert!(d.accept(3000, 7000));
+        // A fully-contained re-segment is still a pure duplicate → drop.
+        assert!(!d.accept(6000, 7000));
+        // Genuinely new audio past the boundary → keep.
+        assert!(d.accept(7000, 9000));
+    }
+
+    #[test]
+    fn config_default_is_english_four_threads() {
+        let c = TranscriberConfig::default();
+        assert_eq!(c.language, "en");
+        assert_eq!(c.n_threads, 4);
     }
 }
