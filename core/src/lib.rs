@@ -632,8 +632,13 @@ pub extern "C" fn note_summarize(handle: *mut NoteHandle, meeting_id: i64) -> *m
                         }
                     };
 
+                    // Persist the flat narrative (shown in meeting lists/detail)
+                    // and the structured fields (richer rendering) side by side.
                     if let Err(e) = h.db.update_meeting_summary(meeting_id, &summary.summary) {
                         error!("Failed to save summary: {}", e);
+                    }
+                    if let Err(e) = h.db.upsert_summary(meeting_id, &summary) {
+                        error!("Failed to save structured summary: {}", e);
                     }
 
                     return string_to_cptr(json);
@@ -651,6 +656,44 @@ pub extern "C" fn note_summarize(handle: *mut NoteHandle, meeting_id: i64) -> *m
             set_last_error("Summarization requires the 'cloud' feature");
             error!("Summarization requires the 'cloud' feature");
             std::ptr::null_mut()
+        }
+    }) {
+        Ok(ptr) => ptr,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Get a previously generated structured summary for a meeting as JSON.
+///
+/// Returns a JSON object (`{summary, key_points, action_items, decisions}`), or
+/// null if none has been generated or on error. Free with [`note_free_string`].
+/// Unlike [`note_summarize`], this does not require the `cloud` feature or network
+/// access -- it reads what was stored at summarization time.
+#[no_mangle]
+pub extern "C" fn note_get_summary(handle: *mut NoteHandle, meeting_id: i64) -> *mut c_char {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    match catch_unwind(|| {
+        let h = unsafe { &*handle };
+        match h.db.get_summary(meeting_id) {
+            Ok(Some(summary)) => match serde_json::to_string(&summary) {
+                Ok(json) => string_to_cptr(json),
+                Err(e) => {
+                    set_last_error(format!("Failed to serialize summary: {}", e));
+                    error!("Failed to serialize summary: {}", e);
+                    std::ptr::null_mut()
+                }
+            },
+            Ok(None) => std::ptr::null_mut(),
+            Err(e) => {
+                set_last_error(format!(
+                    "Failed to get summary for meeting {}: {}",
+                    meeting_id, e
+                ));
+                error!("Failed to get summary for meeting {}: {}", meeting_id, e);
+                std::ptr::null_mut()
+            }
         }
     }) {
         Ok(ptr) => ptr,

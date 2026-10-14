@@ -48,7 +48,10 @@ impl Summarizer for CloudSummarizer {
         let transcript = transcript.to_string();
 
         self.runtime.block_on(async move {
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
             let system_prompt = "You are a meeting summarization assistant. \
                 Given a meeting transcript, produce a JSON object with exactly these fields:\n\
@@ -108,12 +111,32 @@ impl Summarizer for CloudSummarizer {
                 .and_then(|block| block["text"].as_str())
                 .ok_or_else(|| anyhow::anyhow!("Unexpected API response structure"))?;
 
-            let summary: Summary = serde_json::from_str(content_text)
+            // The model is asked for raw JSON, but defensively strip a markdown
+            // code fence (```json … ```) in case it wraps the object anyway.
+            let json_text = strip_json_fences(content_text);
+            let summary: Summary = serde_json::from_str(json_text)
                 .map_err(|e| anyhow::anyhow!("Failed to parse summary JSON: {}", e))?;
 
             Ok(summary)
         })
     }
+}
+
+/// Strip a leading/trailing markdown code fence from a model response so the
+/// inner JSON object can be parsed. Handles ```json, bare ```, and no fence.
+#[cfg(feature = "cloud")]
+fn strip_json_fences(s: &str) -> &str {
+    let t = s.trim();
+    let t = if let Some(rest) = t.strip_prefix("```json") {
+        rest
+    } else if let Some(rest) = t.strip_prefix("```") {
+        rest
+    } else {
+        t
+    };
+    let t = t.trim();
+    let t = t.strip_suffix("```").unwrap_or(t);
+    t.trim()
 }
 
 #[cfg(test)]
@@ -140,5 +163,15 @@ mod tests {
         let result = summarizer.summarize("some transcript").unwrap();
         assert_eq!(result.summary, "Test meeting summary.");
         assert_eq!(result.key_points.len(), 1);
+    }
+
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn strips_markdown_fences() {
+        use super::strip_json_fences;
+        assert_eq!(strip_json_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(strip_json_fences("```\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(strip_json_fences("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(strip_json_fences("  {\"a\":1}  "), "{\"a\":1}");
     }
 }

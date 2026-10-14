@@ -96,6 +96,14 @@ void note_set_transcript_callback(struct NoteHandle *handle,
 // Requires the `cloud` feature and a configured API key (setting `anthropic_api_key`).
 char *note_summarize(struct NoteHandle *handle, int64_t meeting_id);
 
+// Get a previously generated structured summary for a meeting as JSON.
+//
+// Returns a JSON object (`{summary, key_points, action_items, decisions}`), or
+// null if none has been generated or on error. Free with [`note_free_string`].
+// Unlike [`note_summarize`], this does not require the `cloud` feature or network
+// access -- it reads what was stored at summarization time.
+char *note_get_summary(struct NoteHandle *handle, int64_t meeting_id);
+
 // Free a string previously returned by the notetaker library.
 //
 // Passing null is safe (no-op).

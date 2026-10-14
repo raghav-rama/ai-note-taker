@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
-use crate::models::{Meeting, Note, TranscriptSegment};
+use crate::models::{Meeting, Note, Summary, TranscriptSegment};
 
 /// Thread-safe wrapper around a rusqlite `Connection`.
 ///
@@ -251,6 +251,66 @@ impl Database {
         tx.execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ── Summaries ─────────────────────────────────────────────────────
+
+    /// Insert or replace the structured AI summary for a meeting. The three lists
+    /// are stored as JSON arrays in the `meeting_summaries` table.
+    pub fn upsert_summary(&self, meeting_id: i64, summary: &Summary) -> Result<()> {
+        let key_points = serde_json::to_string(&summary.key_points)?;
+        let action_items = serde_json::to_string(&summary.action_items)?;
+        let decisions = serde_json::to_string(&summary.decisions)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meeting_summaries
+                (meeting_id, summary, key_points, action_items, decisions)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(meeting_id) DO UPDATE SET
+                summary = excluded.summary,
+                key_points = excluded.key_points,
+                action_items = excluded.action_items,
+                decisions = excluded.decisions",
+            params![
+                meeting_id,
+                summary.summary,
+                key_points,
+                action_items,
+                decisions
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the structured AI summary for a meeting, if one has been generated.
+    pub fn get_summary(&self, meeting_id: i64) -> Result<Option<Summary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT summary, key_points, action_items, decisions
+             FROM meeting_summaries WHERE meeting_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![meeting_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(row) => {
+                let (summary, key_points, action_items, decisions) = row?;
+                Ok(Some(Summary {
+                    summary,
+                    // Lists are stored as JSON arrays; fall back to empty on any
+                    // legacy/corrupt value rather than failing the read.
+                    key_points: serde_json::from_str(&key_points).unwrap_or_default(),
+                    action_items: serde_json::from_str(&action_items).unwrap_or_default(),
+                    decisions: serde_json::from_str(&decisions).unwrap_or_default(),
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     // ── Transcript Segments ───────────────────────────────────────────
