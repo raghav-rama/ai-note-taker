@@ -352,23 +352,47 @@ impl CoreBridge {
     pub async fn download_model(&self, model_name: &str) -> Result<(), String> {
         let model_name = model_name.to_owned();
         let model_dir = self.model_path.clone();
+        let ctx_cache = self.whisper_ctx.clone();
         self.rt
             .spawn(async move {
+                use tokio::io::AsyncWriteExt;
                 let url = format!(
                     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model_name}.bin"
                 );
                 let dir = std::path::PathBuf::from(&model_dir);
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                tokio::fs::create_dir_all(&dir)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let dest = dir.join(format!("ggml-{model_name}.bin"));
                 let tmp = dir.join(format!("ggml-{model_name}.bin.part"));
 
-                let resp = reqwest::get(url).await.map_err(|e| e.to_string())?;
+                let mut resp = reqwest::get(url).await.map_err(|e| e.to_string())?;
                 if !resp.status().is_success() {
                     return Err(format!("Download failed: HTTP {}", resp.status()));
                 }
-                let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-                std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
-                std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+                // Stream to disk so a large model (medium ~1.5GB) is never fully
+                // buffered in RAM, and the writes are async (not a blocking fs call
+                // parking a runtime worker).
+                let mut file = tokio::fs::File::create(&tmp)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+                    file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                }
+                file.flush().await.map_err(|e| e.to_string())?;
+                drop(file);
+                tokio::fs::rename(&tmp, &dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Invalidate a cached context for this path so the freshly
+                // downloaded model is loaded next time, not the stale Arc.
+                let dest_str = dest.to_string_lossy().into_owned();
+                if let Ok(mut cache) = ctx_cache.lock() {
+                    if cache.as_ref().map(|(p, _)| p == &dest_str).unwrap_or(false) {
+                        *cache = None;
+                    }
+                }
                 Ok::<(), String>(())
             })
             .await

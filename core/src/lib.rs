@@ -390,24 +390,28 @@ pub extern "C" fn note_start_recording(
         clear_last_error();
         let device = unsafe { cstr_to_str(device_id) };
 
-        // Guard against starting a new recording while one is active.
-        if h.current_meeting_id.lock().unwrap().is_some() {
-            set_last_error("Cannot start recording: a recording session is already active");
-            error!("Cannot start recording: a recording session is already active");
-            return NOTE_ERR_INTERNAL;
-        }
-
-        // Create a new meeting.
-        let meeting_id = match h.db.create_meeting("Untitled Meeting") {
-            Ok(id) => id,
-            Err(e) => {
-                set_last_error(format!("Failed to create meeting: {}", e));
-                error!("Failed to create meeting: {}", e);
+        // Claim the session atomically: hold the current_meeting_id lock across
+        // create_meeting so two concurrent starts (e.g. mic + push from different
+        // threads) can't both pass the guard and leak a transcriber / orphan a row.
+        let meeting_id = {
+            let mut guard = h.current_meeting_id.lock().unwrap();
+            if guard.is_some() {
+                set_last_error("Cannot start recording: a recording session is already active");
+                error!("Cannot start recording: a recording session is already active");
                 return NOTE_ERR_INTERNAL;
             }
+            match h.db.create_meeting("Untitled Meeting") {
+                Ok(id) => {
+                    *guard = Some(id);
+                    id
+                }
+                Err(e) => {
+                    set_last_error(format!("Failed to create meeting: {}", e));
+                    error!("Failed to create meeting: {}", e);
+                    return NOTE_ERR_INTERNAL;
+                }
+            }
         };
-
-        *h.current_meeting_id.lock().unwrap() = Some(meeting_id);
 
         // Roll back the active-session state and the orphan meeting row when
         // setup fails after the meeting has been created.
@@ -507,21 +511,27 @@ pub extern "C" fn note_start_recording_push(handle: *mut NoteHandle) -> i32 {
         let h = unsafe { &*handle };
         clear_last_error();
 
-        if h.current_meeting_id.lock().unwrap().is_some() {
-            set_last_error("Cannot start recording: a recording session is already active");
-            error!("Cannot start recording: a recording session is already active");
-            return NOTE_ERR_INTERNAL;
-        }
-
-        let meeting_id = match h.db.create_meeting("Untitled Meeting") {
-            Ok(id) => id,
-            Err(e) => {
-                set_last_error(format!("Failed to create meeting: {}", e));
-                error!("Failed to create meeting: {}", e);
+        // Claim the session atomically (see note_start_recording): hold the lock
+        // across create_meeting so a push start and a mic start can't both proceed.
+        let meeting_id = {
+            let mut guard = h.current_meeting_id.lock().unwrap();
+            if guard.is_some() {
+                set_last_error("Cannot start recording: a recording session is already active");
+                error!("Cannot start recording: a recording session is already active");
                 return NOTE_ERR_INTERNAL;
             }
+            match h.db.create_meeting("Untitled Meeting") {
+                Ok(id) => {
+                    *guard = Some(id);
+                    id
+                }
+                Err(e) => {
+                    set_last_error(format!("Failed to create meeting: {}", e));
+                    error!("Failed to create meeting: {}", e);
+                    return NOTE_ERR_INTERNAL;
+                }
+            }
         };
-        *h.current_meeting_id.lock().unwrap() = Some(meeting_id);
 
         let cleanup = || {
             *h.current_meeting_id.lock().unwrap() = None;

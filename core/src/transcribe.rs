@@ -149,20 +149,17 @@ impl AudioChunker {
         Some((offset, window))
     }
 
-    /// Drain whatever remains as a final window (padded to `min_samples` so
-    /// whisper.cpp accepts it), or `None` if the buffer is empty. Used at
-    /// shutdown so trailing audio is not lost.
-    fn flush(&mut self, min_samples: usize) -> Option<(usize, Vec<f32>)> {
+    /// Drain whatever remains as a final window (the real, unpadded tail), or
+    /// `None` if the buffer is empty. Used at shutdown so trailing audio is not
+    /// lost. Padding to whisper's minimum happens in `transcribe_window` AFTER the
+    /// silence check, so a short tail isn't diluted below the VAD threshold.
+    fn flush(&mut self) -> Option<(usize, Vec<f32>)> {
         if self.buffer.is_empty() {
             return None;
         }
         let offset = self.base_pos;
-        let mut window = std::mem::take(&mut self.buffer);
-        let real_len = window.len();
-        if window.len() < min_samples {
-            window.resize(min_samples, 0.0);
-        }
-        self.base_pos += real_len;
+        let window = std::mem::take(&mut self.buffer);
+        self.base_pos += window.len();
         Some((offset, window))
     }
 }
@@ -182,10 +179,17 @@ impl SegmentDeduper {
     }
 
     /// Returns true if a segment spanning `[start_ms, end_ms)` should be emitted.
-    /// A segment that starts within already-emitted audio is a re-transcription
-    /// of the overlap region and is dropped.
-    fn accept(&mut self, start_ms: i64, end_ms: i64) -> bool {
-        if start_ms < self.emitted_until_ms {
+    ///
+    /// Drop ONLY segments that end at or before the already-emitted boundary —
+    /// i.e. lie entirely within audio a previous overlapping window already
+    /// transcribed. A segment that *straddles* the boundary (`start < emitted <
+    /// end`) carries never-emitted speech in `[emitted, end)`, so it must be kept:
+    /// dropping it whole (the previous behavior, keyed on `start_ms`) silently
+    /// lost that tail and, for one-segment-per-window speech, every seam window,
+    /// up to ~50% of a continuous transcript. Keeping it duplicates a little
+    /// overlap text, which is the correct trade.
+    fn accept(&mut self, _start_ms: i64, end_ms: i64) -> bool {
+        if end_ms <= self.emitted_until_ms {
             return false;
         }
         self.emitted_until_ms = self.emitted_until_ms.max(end_ms);
@@ -317,7 +321,7 @@ fn run_worker(
                 chunker.push(&chunk);
                 drain_windows(&mut chunker, state, &mut deduper);
             }
-            if let Some((offset, window)) = chunker.flush(MIN_SAMPLES) {
+            if let Some((offset, window)) = chunker.flush() {
                 transcribe_window(
                     state, config, &window, offset, &mut deduper, db, meeting_id, callback,
                 );
@@ -329,12 +333,18 @@ fn run_worker(
         match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(chunk) => {
                 chunker.push(&chunk);
+                // Pull in any further already-queued audio so backlog lives in the
+                // chunker (which the 30s cap bounds, dropping oldest) rather than
+                // growing unbounded in the channel when inference falls behind.
+                while let Ok(more) = audio_rx.try_recv() {
+                    chunker.push(&more);
+                }
                 drain_windows(&mut chunker, state, &mut deduper);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Audio source closed: flush the remaining buffer and exit.
-                if let Some((offset, window)) = chunker.flush(MIN_SAMPLES) {
+                if let Some((offset, window)) = chunker.flush() {
                     transcribe_window(
                         state, config, &window, offset, &mut deduper, db, meeting_id, callback,
                     );
@@ -359,10 +369,23 @@ fn transcribe_window(
     meeting_id: i64,
     callback: &Option<TranscriptCallback>,
 ) {
-    // Skip inference on near-silent audio (saves CPU and avoids hallucinated text).
+    // Skip inference on near-silent audio (saves CPU and avoids hallucinated
+    // text). Check RMS on the real audio BEFORE padding so a short flush tail is
+    // not diluted below the threshold by trailing zeros.
     if rms(audio) < SILENCE_RMS {
         return;
     }
+
+    // whisper.cpp needs ~1s of samples; pad only a short (final flush) window
+    // with silence. Full windows from next_window() are already CHUNK_SIZE.
+    let mut padded_buf;
+    let audio: &[f32] = if audio.len() < MIN_SAMPLES {
+        padded_buf = audio.to_vec();
+        padded_buf.resize(MIN_SAMPLES, 0.0);
+        &padded_buf
+    } else {
+        audio
+    };
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(config.n_threads);
@@ -501,19 +524,21 @@ mod tests {
     }
 
     #[test]
-    fn chunker_flush_pads_short_tail() {
+    fn chunker_flush_returns_real_tail_unpadded() {
         let mut c = AudioChunker::new(10, 4, 100);
         c.push(&vec![0.3; 3]);
         assert!(c.next_window().is_none());
-        let (off, w) = c.flush(8).expect("flush tail");
+        let (off, w) = c.flush().expect("flush tail");
         assert_eq!(off, 0);
-        assert_eq!(w.len(), 8); // padded from 3 up to min 8
+        // Real tail, not padded — padding to the whisper minimum happens in
+        // transcribe_window after the silence check.
+        assert_eq!(w.len(), 3);
     }
 
     #[test]
     fn chunker_flush_empty_is_none() {
         let mut c = AudioChunker::new(10, 4, 100);
-        assert!(c.flush(8).is_none());
+        assert!(c.flush().is_none());
     }
 
     #[test]
@@ -534,6 +559,20 @@ mod tests {
     fn deduper_accepts_first_segment_at_zero() {
         let mut d = SegmentDeduper::new();
         assert!(d.accept(0, 500));
+    }
+
+    #[test]
+    fn deduper_keeps_straddling_segment_with_new_tail() {
+        // Regression for the ~50% transcript-loss bug: a seam window re-transcribes
+        // the 1s overlap AND carries new speech past the boundary. It must be kept.
+        let mut d = SegmentDeduper::new();
+        assert!(d.accept(0, 4000)); // emitted_until = 4000
+        // Straddles 4000 (new audio in [4000,7000)) → keep (old start_ms rule dropped this).
+        assert!(d.accept(3000, 7000));
+        // A fully-contained re-segment is still a pure duplicate → drop.
+        assert!(!d.accept(6000, 7000));
+        // Genuinely new audio past the boundary → keep.
+        assert!(d.accept(7000, 9000));
     }
 
     #[test]

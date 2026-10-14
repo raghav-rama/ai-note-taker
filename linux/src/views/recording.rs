@@ -126,17 +126,24 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
         let level = level_bar.clone();
         let bridge_ref = bridge.clone();
         let recording = is_recording.clone();
+        let paused_t = paused.clone();
         let secs = elapsed_secs.clone();
 
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
             if recording.get() {
-                let s = secs.get() + 1;
-                secs.set(s);
-                let h = s / 3600;
-                let m = (s % 3600) / 60;
-                let sec = s % 60;
-                timer.set_label(&format!("{h:02}:{m:02}:{sec:02}"));
-                level.set_value(bridge_ref.audio_level() as f64);
+                if paused_t.get() {
+                    // While paused, don't advance the elapsed timer and show no
+                    // input level (the capture is stopped, so audio_level is stale).
+                    level.set_value(0.0);
+                } else {
+                    let s = secs.get() + 1;
+                    secs.set(s);
+                    let h = s / 3600;
+                    let m = (s % 3600) / 60;
+                    let sec = s % 60;
+                    timer.set_label(&format!("{h:02}:{m:02}:{sec:02}"));
+                    level.set_value(bridge_ref.audio_level() as f64);
+                }
             }
             glib::ControlFlow::Continue
         });
