@@ -125,9 +125,18 @@ impl CoreBridge {
 
                 match build() {
                     Ok((cap, transcriber)) => {
-                        *capture_slot.lock().unwrap() = Some(cap);
-                        *transcriber_slot.lock().unwrap() = Some(transcriber);
-                        Ok(())
+                        // If a stop ran during the (slow) model load it will have
+                        // taken our meeting id; don't install a now-orphaned live
+                        // capture/transcriber — tear them down instead.
+                        if *meeting_slot.lock().unwrap() == Some(meeting_id) {
+                            *capture_slot.lock().unwrap() = Some(cap);
+                            *transcriber_slot.lock().unwrap() = Some(transcriber);
+                            Ok(())
+                        } else {
+                            let _ = cap.stop();
+                            transcriber.stop();
+                            Err("Recording was stopped during startup".to_string())
+                        }
                     }
                     Err(e) => {
                         *meeting_slot.lock().unwrap() = None;
@@ -154,15 +163,21 @@ impl CoreBridge {
     }
 
     pub async fn stop_recording(&self) -> Result<i64, String> {
-        // We are stopping regardless of how teardown goes, so release the claim
-        // immediately — this also lets the user start a fresh recording even if
-        // ending the meeting in the DB fails.
-        self.recording.store(false, Ordering::SeqCst);
+        // Atomically take ownership of the active session's resources up front.
+        // A duplicate or overlapping stop then finds the slots already emptied
+        // and bails out, so two stops can't both tear down and finalize meetings
+        // out from under each other. The `recording` claim is deliberately NOT
+        // cleared here — it is released inside the blocking task only once
+        // teardown is complete, so no new recording can start mid-teardown.
+        let cap = self.capture.lock().unwrap().take();
+        let transcriber = self.transcriber.lock().unwrap().take();
+        let meeting_id = match self.current_meeting_id.lock().unwrap().take() {
+            Some(id) => id,
+            None => return Err("No active recording".to_string()),
+        };
 
-        let capture_slot = self.capture.clone();
-        let transcriber_slot = self.transcriber.clone();
-        let meeting_slot = self.current_meeting_id.clone();
         let db = self.db.clone();
+        let recording = self.recording.clone();
 
         self.rt
             .spawn_blocking(move || {
@@ -171,27 +186,24 @@ impl CoreBridge {
                 // drain would run against a still-live capture and, when
                 // inference is slower than real-time, never empty the backlog —
                 // hanging the worker-thread join (and this stop future) forever.
-                if let Some(cap) = capture_slot.lock().unwrap().take() {
+                if let Some(cap) = cap {
                     let _ = cap.stop();
                 }
 
                 // With the sender gone the transcriber drains the now-finite
-                // backlog, flushes a final segment, and its thread joins. Take
-                // it out of the slot before joining so the mutex isn't held
-                // across the join.
-                let transcriber = transcriber_slot.lock().unwrap().take();
+                // backlog, flushes a final segment, and its thread joins.
                 if let Some(transcriber) = transcriber {
                     transcriber.stop();
                 }
 
-                let meeting_id = meeting_slot
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .ok_or_else(|| "No active meeting".to_string())?;
-                db.end_meeting(meeting_id).map_err(|e| e.to_string())?;
+                let result = db.end_meeting(meeting_id).map_err(|e| e.to_string());
 
-                Ok(meeting_id)
+                // Release the claim only now that capture, transcriber, and the
+                // meeting have all been finalized, so a fresh recording can start
+                // even if ending the meeting in the DB failed.
+                recording.store(false, Ordering::SeqCst);
+
+                result.map(|_| meeting_id)
             })
             .await
             .map_err(|e| e.to_string())?

@@ -229,9 +229,18 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
             let ai_c = ai.clone();
             let dec_c = dec.clone();
             let btn_c = btn.clone();
+            let meeting_id_c = meeting_id.clone();
 
             glib::spawn_future_local(async move {
-                match bridge_c.summarize(mid).await {
+                let result = bridge_c.summarize(mid).await;
+                // Discard a summary for a meeting the user has since navigated
+                // away from, so it can't overwrite the now-current meeting's view
+                // (while Export would still operate on the newer selection).
+                if *meeting_id_c.borrow() != Some(mid) {
+                    btn_c.set_sensitive(true);
+                    return;
+                }
+                match result {
                     Ok(text) => {
                         // The summary is expected as plain text. A more
                         // sophisticated implementation would parse structured

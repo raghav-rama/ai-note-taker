@@ -266,22 +266,33 @@ pub extern "C" fn note_start_recording(
             });
         drop(cb_lock);
 
-        // Resolve the model file. `model_path` is normally a models directory
-        // (Linux/Android/iOS), in which we compose ggml-{whisper_model}.bin from
-        // the configured model name (default "tiny"). Legacy callers (macOS,
-        // Windows) still pass a full model file path — detect that and use it
-        // verbatim so composing doesn't produce `.../ggml-tiny.bin/ggml-...bin`.
-        let model_file = if std::path::Path::new(&h.model_path).is_dir() {
-            let model_name = h
-                .db
-                .get_setting("whisper_model")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "tiny".to_string());
-            format!("{}/ggml-{}.bin", h.model_path, model_name)
-        } else {
-            h.model_path.clone()
+        // Resolve the models directory, then compose the model file from the
+        // configured `whisper_model` (default "tiny"). `model_path` is normally a
+        // directory (Linux/Android/iOS); legacy callers (macOS/Windows) pass a
+        // model *file* path, so we take that file's parent as the directory.
+        // Deriving the directory (rather than using a file path verbatim) means
+        // the selected model is honored on every platform and a file path never
+        // gets doubled into `.../ggml-tiny.bin/ggml-...bin`.
+        let model_dir = {
+            let p = std::path::Path::new(&h.model_path);
+            if h.model_path.ends_with(".bin") {
+                p.parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            } else {
+                p.to_path_buf()
+            }
         };
+        let model_name = h
+            .db
+            .get_setting("whisper_model")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "tiny".to_string());
+        let model_file = model_dir
+            .join(format!("ggml-{}.bin", model_name))
+            .to_string_lossy()
+            .into_owned();
 
         // Start the transcriber.
         let transcriber = match LocalTranscriber::new(
