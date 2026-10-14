@@ -262,6 +262,20 @@ impl CoreBridge {
             .map_err(|e| e.to_string())?
     }
 
+    pub async fn resume_recording(&self) -> Result<(), String> {
+        let capture_slot = self.capture.clone();
+        self.rt
+            .spawn_blocking(move || {
+                if let Some(ref cap) = *capture_slot.lock().unwrap() {
+                    cap.resume().map_err(|e| e.to_string())
+                } else {
+                    Err("No active recording".to_string())
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
     pub fn audio_level(&self) -> f32 {
         *self.audio_level.lock().unwrap()
     }
@@ -279,8 +293,12 @@ impl CoreBridge {
 
     // ── Meetings / Storage ─────────────────────────────────────────────
 
+    /// Generate an AI summary for a meeting via the Anthropic API, persist both
+    /// the structured fields and a formatted narrative, and return the narrative
+    /// (with markdown section headers the Notes view parses).
     pub async fn summarize(&self, meeting_id: i64) -> Result<String, String> {
         let db = self.db.clone();
+        let rt = self.rt.clone();
         self.rt
             .spawn_blocking(move || {
                 let segments = db.get_segments(meeting_id).map_err(|e| e.to_string())?;
@@ -289,15 +307,69 @@ impl CoreBridge {
                     .map(|s| s.text.as_str())
                     .collect::<Vec<_>>()
                     .join(" ");
-                if transcript.is_empty() {
-                    Ok("No transcript available to summarize.".to_string())
-                } else {
-                    Ok(format!(
-                        "Transcript ({} segments, {} chars). Cloud summarization requires an API key — configure one in Settings.",
-                        segments.len(),
-                        transcript.len()
-                    ))
+                if transcript.trim().is_empty() {
+                    return Err("No transcript available to summarize.".to_string());
                 }
+
+                let api_key = db
+                    .get_setting("anthropic_api_key")
+                    .map_err(|e| e.to_string())?
+                    .filter(|k| !k.trim().is_empty())
+                    .ok_or_else(|| {
+                        "No Anthropic API key configured. Add one in Settings.".to_string()
+                    })?;
+                let model = db.get_setting("anthropic_model").ok().flatten();
+
+                use notetaker::summarize::Summarizer;
+                let summarizer = notetaker::summarize::CloudSummarizer::new(api_key, model, rt);
+                let summary = summarizer.summarize(&transcript).map_err(|e| e.to_string())?;
+
+                let formatted = format_summary(&summary);
+                // Persist the structured row and the formatted narrative (shown on
+                // reload and parsed into sections by the Notes view).
+                db.update_meeting_summary(meeting_id, &formatted)
+                    .map_err(|e| e.to_string())?;
+                db.upsert_summary(meeting_id, &summary)
+                    .map_err(|e| e.to_string())?;
+                Ok(formatted)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    /// Search meetings by transcript text (FTS5), newest first.
+    pub async fn search_meetings(&self, query: &str) -> Result<Vec<Meeting>, String> {
+        let query = query.to_owned();
+        let db = self.db.clone();
+        self.rt
+            .spawn_blocking(move || db.search_meetings_full(&query).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    /// Download a Whisper model (`tiny`/`base`/`small`/`medium`) from Hugging Face
+    /// into the models directory, writing atomically via a `.part` temp file.
+    pub async fn download_model(&self, model_name: &str) -> Result<(), String> {
+        let model_name = model_name.to_owned();
+        let model_dir = self.model_path.clone();
+        self.rt
+            .spawn(async move {
+                let url = format!(
+                    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model_name}.bin"
+                );
+                let dir = std::path::PathBuf::from(&model_dir);
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let dest = dir.join(format!("ggml-{model_name}.bin"));
+                let tmp = dir.join(format!("ggml-{model_name}.bin.part"));
+
+                let resp = reqwest::get(url).await.map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("Download failed: HTTP {}", resp.status()));
+                }
+                let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+                std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+                std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+                Ok::<(), String>(())
             })
             .await
             .map_err(|e| e.to_string())?
@@ -380,4 +452,30 @@ impl CoreBridge {
             .await
             .map_err(|e| e.to_string())?
     }
+}
+
+/// Format a structured summary into markdown with section headers the Notes view
+/// parses (`## Key Points`, `## Action Items`, `## Decisions`).
+fn format_summary(s: &notetaker::models::Summary) -> String {
+    let mut out = String::new();
+    out.push_str(&s.summary);
+    if !s.key_points.is_empty() {
+        out.push_str("\n\n## Key Points\n");
+        for p in &s.key_points {
+            out.push_str(&format!("- {p}\n"));
+        }
+    }
+    if !s.action_items.is_empty() {
+        out.push_str("\n## Action Items\n");
+        for p in &s.action_items {
+            out.push_str(&format!("- {p}\n"));
+        }
+    }
+    if !s.decisions.is_empty() {
+        out.push_str("\n## Decisions\n");
+        for p in &s.decisions {
+            out.push_str(&format!("- {p}\n"));
+        }
+    }
+    out
 }
