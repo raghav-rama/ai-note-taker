@@ -171,6 +171,9 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
             let bridge_c = bridge_ref.clone();
             let summary_c = summary.clone();
             let transcript_c = transcript.clone();
+            let kp_c = kp.clone();
+            let ai_c = ai.clone();
+            let dec_c = dec.clone();
             let gen_c = load_gen.clone();
             glib::spawn_future_local(async move {
                 let meeting = bridge_c.get_meeting(mid).await;
@@ -182,10 +185,21 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                 }
                 match meeting {
                     Ok(meeting) => {
-                        summary_c.set_label(&format!(
-                            "{}\n\nPress \u{201c}Generate Summary\u{201d} to create notes.",
-                            meeting.title
-                        ));
+                        match meeting.summary.as_deref() {
+                            // A summary was generated earlier and stored — show it
+                            // (and its parsed sections) instead of the prompt.
+                            Some(s) if !s.trim().is_empty() => {
+                                summary_c.set_label(s);
+                                let sections = parse_summary_sections(s);
+                                kp_c.set_label(&sections.key_points);
+                                ai_c.set_label(&sections.action_items);
+                                dec_c.set_label(&sections.decisions);
+                            }
+                            _ => summary_c.set_label(&format!(
+                                "{}\n\nPress \u{201c}Generate Summary\u{201d} to create notes.",
+                                meeting.title
+                            )),
+                        }
                         summary_c.remove_css_class("dim-label");
                     }
                     Err(e) => summary_c.set_label(&format!("Failed to load meeting: {e}")),
