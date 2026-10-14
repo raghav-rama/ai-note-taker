@@ -17,6 +17,84 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+/// Ordered schema migrations. The database's `PRAGMA user_version` records how
+/// many of these have been applied; [`Database::open`] runs any that are pending.
+///
+/// **Append-only.** Never edit or reorder an existing entry — a shipped database
+/// has already applied it and will not re-run it. Add new schema changes as new
+/// array elements. Each migration must be safe to apply to a database that a
+/// previous app version created (hence `IF NOT EXISTS` on migration 1, which also
+/// upgrades Phase-1 databases that have the tables but `user_version = 0`).
+const MIGRATIONS: &[&str] = &[
+    // ── Migration 1: initial schema ──────────────────────────────────────
+    "
+    CREATE TABLE IF NOT EXISTS meetings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL DEFAULT 'Untitled Meeting',
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        duration_secs INTEGER,
+        summary TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS transcript_segments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        meeting_id INTEGER NOT NULL REFERENCES meetings(id),
+        timestamp_ms INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        confidence REAL
+    );
+
+    CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        meeting_id INTEGER NOT NULL REFERENCES meetings(id),
+        content TEXT NOT NULL,
+        note_type TEXT NOT NULL DEFAULT 'summary',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    -- FTS5 virtual table for full-text search over transcript segments.
+    CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
+        text,
+        content='transcript_segments',
+        content_rowid='id'
+    );
+
+    -- Triggers to keep the FTS index in sync.
+    CREATE TRIGGER IF NOT EXISTS transcript_fts_ai AFTER INSERT ON transcript_segments BEGIN
+        INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS transcript_fts_ad AFTER DELETE ON transcript_segments BEGIN
+        INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.id, old.text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS transcript_fts_au AFTER UPDATE ON transcript_segments BEGIN
+        INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.id, old.text);
+        INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+    ",
+    // ── Migration 2: structured AI summaries ─────────────────────────────
+    // One row per meeting. The narrative lives in `summary`; the three lists are
+    // stored as JSON arrays so the structured shape survives without widening the
+    // `meetings` row (which is the JSON contract the native apps decode).
+    "
+    CREATE TABLE IF NOT EXISTS meeting_summaries (
+        meeting_id   INTEGER PRIMARY KEY REFERENCES meetings(id),
+        summary      TEXT NOT NULL,
+        key_points   TEXT NOT NULL DEFAULT '[]',
+        action_items TEXT NOT NULL DEFAULT '[]',
+        decisions    TEXT NOT NULL DEFAULT '[]'
+    );
+    ",
+];
+
 impl Database {
     /// Open (or create) a database at the given path and apply migrations.
     pub fn open(path: &str) -> Result<Self> {
@@ -24,74 +102,44 @@ impl Database {
             .with_context(|| format!("Failed to open database at {}", path))?;
 
         // Enable WAL mode for better concurrent read performance.
+        // (On `:memory:` databases this is a no-op and journal_mode stays
+        // "memory"; execute_batch ignores the returned row either way.)
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         let db = Self {
             conn: Mutex::new(conn),
         };
-        db.create_schema()?;
+        db.run_migrations()?;
         Ok(db)
     }
 
-    /// Create all tables if they do not already exist.
-    fn create_schema(&self) -> Result<()> {
+    /// Return the current schema version (`PRAGMA user_version`).
+    pub fn schema_version(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS meetings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL DEFAULT 'Untitled Meeting',
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                duration_secs INTEGER,
-                summary TEXT
-            );
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(v)
+    }
 
-            CREATE TABLE IF NOT EXISTS transcript_segments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                meeting_id INTEGER NOT NULL REFERENCES meetings(id),
-                timestamp_ms INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                confidence REAL
-            );
+    /// Apply any migrations the database has not yet seen, advancing
+    /// `user_version` after each. Each migration runs in its own transaction so a
+    /// failure leaves the version pointing at the last fully-applied migration.
+    fn run_migrations(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut current: usize = conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?
+            .max(0) as usize;
 
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                meeting_id INTEGER NOT NULL REFERENCES meetings(id),
-                content TEXT NOT NULL,
-                note_type TEXT NOT NULL DEFAULT 'summary',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            -- FTS5 virtual table for full-text search over transcript segments.
-            CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
-                text,
-                content='transcript_segments',
-                content_rowid='id'
-            );
-
-            -- Triggers to keep the FTS index in sync.
-            CREATE TRIGGER IF NOT EXISTS transcript_fts_ai AFTER INSERT ON transcript_segments BEGIN
-                INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS transcript_fts_ad AFTER DELETE ON transcript_segments BEGIN
-                INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.id, old.text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS transcript_fts_au AFTER UPDATE ON transcript_segments BEGIN
-                INSERT INTO transcript_fts(transcript_fts, rowid, text) VALUES('delete', old.id, old.text);
-                INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
-            END;
-            ",
-        )?;
+        while current < MIGRATIONS.len() {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(MIGRATIONS[current])
+                .with_context(|| format!("Failed to apply migration {}", current + 1))?;
+            // `user_version` takes an integer literal (it cannot be parameterized);
+            // the value is an internal counter, never user input, so this is safe.
+            tx.execute_batch(&format!("PRAGMA user_version = {};", current + 1))?;
+            tx.commit()?;
+            current += 1;
+        }
         Ok(())
     }
 
