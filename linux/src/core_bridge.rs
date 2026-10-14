@@ -7,6 +7,7 @@ use notetaker::audio::{self, AudioCapture, AudioLevelCallback};
 use notetaker::models::{AudioDevice, Meeting, TranscriptSegment};
 use notetaker::storage::Database;
 use notetaker::transcribe::{LocalTranscriber, TranscriptCallback};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 
@@ -18,6 +19,7 @@ pub struct CoreBridge {
     current_meeting_id: Arc<Mutex<Option<i64>>>,
     audio_level: Arc<Mutex<f32>>,
     transcript_tx: Arc<Mutex<Option<async_channel::Sender<TranscriptSegment>>>>,
+    recording: Arc<AtomicBool>,
     rt: Handle,
 }
 
@@ -32,6 +34,7 @@ impl CoreBridge {
             current_meeting_id: Arc::new(Mutex::new(None)),
             audio_level: Arc::new(Mutex::new(0.0)),
             transcript_tx: Arc::new(Mutex::new(None)),
+            recording: Arc::new(AtomicBool::new(false)),
             rt,
         })
     }
@@ -39,6 +42,17 @@ impl CoreBridge {
     // ── Recording ──────────────────────────────────────────────────────
 
     pub async fn start_recording(&self, device_id: Option<String>) -> Result<(), String> {
+        // Claim the recording slot before the (slow, blocking) model load so a
+        // second click during initialization can't create a second meeting and
+        // clobber the shared capture/transcriber slots.
+        if self
+            .recording
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("A recording is already in progress".to_string());
+        }
+
         let db = self.db.clone();
         let capture_slot = self.capture.clone();
         let transcriber_slot = self.transcriber.clone();
@@ -47,8 +61,9 @@ impl CoreBridge {
         let transcript_tx = self.transcript_tx.clone();
         let model_dir = self.model_path.clone();
 
-        self.rt
-            .spawn_blocking(move || {
+        let outcome = self
+            .rt
+            .spawn_blocking(move || -> Result<(), String> {
                 let meeting_id = db
                     .create_meeting("Untitled Meeting")
                     .map_err(|e| e.to_string())?;
@@ -121,11 +136,29 @@ impl CoreBridge {
                     }
                 }
             })
-            .await
-            .map_err(|e| e.to_string())?
+            .await;
+
+        // Release the claim on any failure (join error or setup error) so the
+        // user can retry; on success it stays held until stop_recording.
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.recording.store(false, Ordering::SeqCst);
+                Err(e)
+            }
+            Err(join_err) => {
+                self.recording.store(false, Ordering::SeqCst);
+                Err(join_err.to_string())
+            }
+        }
     }
 
     pub async fn stop_recording(&self) -> Result<i64, String> {
+        // We are stopping regardless of how teardown goes, so release the claim
+        // immediately — this also lets the user start a fresh recording even if
+        // ending the meeting in the DB fails.
+        self.recording.store(false, Ordering::SeqCst);
+
         let capture_slot = self.capture.clone();
         let transcriber_slot = self.transcriber.clone();
         let meeting_slot = self.current_meeting_id.clone();

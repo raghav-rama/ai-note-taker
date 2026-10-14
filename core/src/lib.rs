@@ -266,15 +266,22 @@ pub extern "C" fn note_start_recording(
             });
         drop(cb_lock);
 
-        // Resolve the model file inside the models directory from the
-        // configured `whisper_model` name (default "tiny").
-        let model_name = h
-            .db
-            .get_setting("whisper_model")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "tiny".to_string());
-        let model_file = format!("{}/ggml-{}.bin", h.model_path, model_name);
+        // Resolve the model file. `model_path` is normally a models directory
+        // (Linux/Android/iOS), in which we compose ggml-{whisper_model}.bin from
+        // the configured model name (default "tiny"). Legacy callers (macOS,
+        // Windows) still pass a full model file path — detect that and use it
+        // verbatim so composing doesn't produce `.../ggml-tiny.bin/ggml-...bin`.
+        let model_file = if std::path::Path::new(&h.model_path).is_dir() {
+            let model_name = h
+                .db
+                .get_setting("whisper_model")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "tiny".to_string());
+            format!("{}/ggml-{}.bin", h.model_path, model_name)
+        } else {
+            h.model_path.clone()
+        };
 
         // Start the transcriber.
         let transcriber = match LocalTranscriber::new(

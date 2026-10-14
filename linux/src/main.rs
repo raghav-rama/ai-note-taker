@@ -41,7 +41,14 @@ fn main() {
                 })
                 .unwrap_or(false)
         };
-        let local = std::path::PathBuf::from("models");
+        // Resolve the bundled "models" dir next to the executable (not the
+        // process CWD), so launching from another directory or a desktop
+        // launcher still finds the model shipped in the artifact.
+        let local = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("models");
         let xdg_models = data_dir.join("models");
         if has_model(&local) {
             local
