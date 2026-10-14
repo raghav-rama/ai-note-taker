@@ -181,13 +181,13 @@ struct Note: Codable, Identifiable, Hashable {
 // MARK: - Summary (parsed from AI-generated JSON)
 
 struct Summary: Codable, Hashable {
-    let overview: String
+    let summary: String
     let keyPoints: [String]
     let actionItems: [String]
     let decisions: [String]
 
     enum CodingKeys: String, CodingKey {
-        case overview
+        case summary
         case key_points
         case action_items
         case decisions
@@ -195,7 +195,7 @@ struct Summary: Codable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        overview = try c.decode(String.self, forKey: .overview)
+        summary = try c.decode(String.self, forKey: .summary)
         keyPoints = try c.decodeIfPresent([String].self, forKey: .key_points) ?? []
         actionItems = try c.decodeIfPresent([String].self, forKey: .action_items) ?? []
         decisions = try c.decodeIfPresent([String].self, forKey: .decisions) ?? []
@@ -203,14 +203,14 @@ struct Summary: Codable, Hashable {
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(overview, forKey: .overview)
+        try c.encode(summary, forKey: .summary)
         try c.encode(keyPoints, forKey: .key_points)
         try c.encode(actionItems, forKey: .action_items)
         try c.encode(decisions, forKey: .decisions)
     }
 
-    init(overview: String, keyPoints: [String], actionItems: [String], decisions: [String]) {
-        self.overview = overview
+    init(summary: String, keyPoints: [String], actionItems: [String], decisions: [String]) {
+        self.summary = summary
         self.keyPoints = keyPoints
         self.actionItems = actionItems
         self.decisions = decisions

@@ -128,10 +128,11 @@ object CoreBridge {
     // --- Transcript callback (called from native side) ---
 
     @JvmStatic
-    fun onTranscript(text: String, timestampMs: Double) {
+    fun onTranscript(text: String, timestampSecs: Double) {
         val segment = TranscriptSegment(
             text = text,
-            timestampMs = timestampMs.toLong(),
+            // The C FFI delivers the timestamp in seconds; the model stores milliseconds.
+            timestampMs = (timestampSecs * 1000).toLong(),
         )
         _transcriptSegments.tryEmit(segment)
     }

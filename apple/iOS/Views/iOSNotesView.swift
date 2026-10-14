@@ -96,7 +96,7 @@ struct iOSNotesView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Label("Overview", systemImage: "doc.text")
                     .font(.headline)
-                Text(summary.overview)
+                Text(summary.summary)
                     .font(.body)
             }
 

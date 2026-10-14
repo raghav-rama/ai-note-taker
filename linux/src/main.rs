@@ -22,8 +22,38 @@ fn main() {
     std::fs::create_dir_all(&data_dir).ok();
 
     let db_path = data_dir.join("data.db");
-    let model_path = data_dir.join("models");
-    std::fs::create_dir_all(&model_path).ok();
+
+    // Whisper models: prefer whichever location already holds a ggml-*.bin
+    // model. The downloadable artifact bundles the model under ./models next to
+    // the binary; otherwise models live under the XDG data dir
+    // (~/.local/share/session-monitor/models), where the in-app downloader
+    // writes them. Only when neither has a model yet do we create a directory
+    // (XDG first, then ./models) for a future download.
+    let model_path = {
+        let has_model = |dir: &std::path::Path| -> bool {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries.flatten().any(|e| {
+                        let name = e.file_name();
+                        let name = name.to_string_lossy();
+                        name.starts_with("ggml-") && name.ends_with(".bin")
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let local = std::path::PathBuf::from("models");
+        let xdg_models = data_dir.join("models");
+        if has_model(&local) {
+            local
+        } else if has_model(&xdg_models) {
+            xdg_models
+        } else if std::fs::create_dir_all(&xdg_models).is_ok() {
+            xdg_models
+        } else {
+            std::fs::create_dir_all(&local).ok();
+            local
+        }
+    };
 
     // Initialize the core bridge that wraps notetaker-core.
     let bridge = match CoreBridge::new(

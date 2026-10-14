@@ -1,5 +1,5 @@
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -134,6 +134,65 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
     // ── State: current meeting ID ──────────────────────────────────────
 
     let current_meeting_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
+
+    // "load" action — invoked from the History view when a meeting is selected.
+    // It carries the meeting id as an int64 parameter, sets it as the current
+    // meeting, and loads the meeting's title and transcript into the view.
+    {
+        let bridge_ref = bridge.clone();
+        let meeting_id = current_meeting_id.clone();
+        let summary = summary_label.clone();
+        let transcript = transcript_label.clone();
+        let kp = key_points_label.clone();
+        let ai = action_items_label.clone();
+        let dec = decisions_label.clone();
+
+        let actions = gio::SimpleActionGroup::new();
+        let load_action = gio::SimpleAction::new("load", Some(glib::VariantTy::INT64));
+        load_action.connect_activate(move |_, param| {
+            let Some(mid) = param.and_then(|v| v.get::<i64>()) else {
+                return;
+            };
+            *meeting_id.borrow_mut() = Some(mid);
+
+            // Clear sections parsed from any previously viewed meeting.
+            kp.set_label("");
+            ai.set_label("");
+            dec.set_label("");
+
+            let bridge_c = bridge_ref.clone();
+            let summary_c = summary.clone();
+            let transcript_c = transcript.clone();
+            glib::spawn_future_local(async move {
+                match bridge_c.get_meeting(mid).await {
+                    Ok(meeting) => {
+                        summary_c.set_label(&format!(
+                            "{}\n\nPress \u{201c}Generate Summary\u{201d} to create notes.",
+                            meeting.title
+                        ));
+                        summary_c.remove_css_class("dim-label");
+                    }
+                    Err(e) => summary_c.set_label(&format!("Failed to load meeting: {e}")),
+                }
+
+                match bridge_c.get_transcript(mid).await {
+                    Ok(segments) => {
+                        let text = segments
+                            .iter()
+                            .map(|s| {
+                                format!("[{:.1}s] {}", s.timestamp_ms as f64 / 1000.0, s.text)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        transcript_c.set_label(&text);
+                    }
+                    Err(e) => transcript_c.set_label(&format!("Failed to load transcript: {e}")),
+                }
+            });
+        });
+        actions.add_action(&load_action);
+        outer.insert_action_group("notes", Some(&actions));
+    }
 
     // Generate summary button handler.
     {

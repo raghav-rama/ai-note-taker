@@ -37,6 +37,9 @@ build/
 
 # Windows / Visual Studio
 bin/
+# Rust source binaries live in core/src/bin — these are source, not build output.
+!core/src/bin/
+!core/src/bin/**
 obj/
 *.suo
 *.user

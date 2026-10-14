@@ -93,6 +93,24 @@ impl LocalTranscriber {
             loop {
                 // Check for shutdown.
                 if shutdown_rx.try_recv().is_ok() {
+                    // Drain audio still queued in the channel: a shutdown signal
+                    // can arrive before recv_timeout has consumed the backlog, so
+                    // flushing only `buffer` would drop trailing audio.
+                    while let Ok(chunk) = audio_rx.try_recv() {
+                        buffer.extend_from_slice(&chunk);
+                        while buffer.len() >= CHUNK_SIZE {
+                            let block: Vec<f32> = buffer.drain(..CHUNK_SIZE).collect();
+                            Self::transcribe_chunk(
+                                &ctx,
+                                &block,
+                                total_samples_processed,
+                                &db,
+                                meeting_id,
+                                &callback,
+                            );
+                            total_samples_processed += CHUNK_SIZE;
+                        }
+                    }
                     // Process any remaining audio in the buffer, padding if needed.
                     if !buffer.is_empty() {
                         if buffer.len() < MIN_SAMPLES {

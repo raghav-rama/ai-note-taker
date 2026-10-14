@@ -279,6 +279,11 @@ impl Database {
     /// Search meetings whose transcripts match the given query.
     /// Returns meeting ids that contain matching transcript segments.
     pub fn search_meetings(&self, query: &str) -> Result<Vec<i64>> {
+        // An empty/whitespace query would become MATCH '""', which is not a
+        // meaningful search; return no results rather than erroring.
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT ts.meeting_id
@@ -287,7 +292,10 @@ impl Database {
              WHERE transcript_fts MATCH ?1
              ORDER BY ts.meeting_id DESC",
         )?;
-        let rows = stmt.query_map(params![query], |row| row.get::<_, i64>(0))?;
+        // Quote the whole query so FTS5 operator characters are matched
+        // literally; embedded double-quotes are escaped by doubling them.
+        let match_query = format!("\"{}\"", query.replace('"', "\"\""));
+        let rows = stmt.query_map(params![match_query], |row| row.get::<_, i64>(0))?;
         let mut ids = Vec::new();
         for row in rows {
             ids.push(row?);

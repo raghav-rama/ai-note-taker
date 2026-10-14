@@ -48,6 +48,8 @@ ifeq ($(UNAME_S),Darwin)
 		core/target/x86_64-apple-darwin/$(PROFILE)/libnotetaker.dylib \
 		-output core/target/universal/$(PROFILE)/libnotetaker.dylib
 	# Build macOS app
+	# NOTE: apple/NoteHelper.xcodeproj does not exist yet; it is generated via
+	# XcodeGen (apple/project.yml) in a later phase.
 	xcodebuild -project apple/NoteHelper.xcodeproj \
 		-scheme NoteHelper-macOS \
 		-configuration Release \
@@ -72,6 +74,8 @@ ifeq ($(UNAME_S),Darwin)
 		-library core/target/aarch64-apple-ios-sim/$(PROFILE)/libnotetaker.a \
 		-output core/target/NoteCore.xcframework
 	# Build iOS app
+	# NOTE: apple/NoteHelper.xcodeproj does not exist yet; it is generated via
+	# XcodeGen (apple/project.yml) in a later phase.
 	xcodebuild -project apple/NoteHelper.xcodeproj \
 		-scheme NoteHelper-iOS \
 		-configuration Release \
@@ -87,7 +91,7 @@ endif
 build-windows:
 	$(CARGO) build --manifest-path core/Cargo.toml $(CARGO_FLAGS) \
 		--target x86_64-pc-windows-msvc
-	dotnet build windows/NoteHelper.sln -c Release
+	dotnet build windows/NoteHelper/NoteHelper.sln -c Release
 
 # ─── Linux ───────────────────────────────────────────────────────────────────
 
@@ -146,7 +150,7 @@ clean:
 	$(CARGO) clean --manifest-path linux/Cargo.toml 2>/dev/null || true
 	rm -rf apple/build
 	rm -rf android/app/build
-	cd windows && dotnet clean NoteHelper.sln 2>/dev/null || true
+	cd windows && dotnet clean NoteHelper/NoteHelper.sln 2>/dev/null || true
 
 .PHONY: clean-models
 clean-models:

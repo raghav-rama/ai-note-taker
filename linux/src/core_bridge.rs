@@ -6,6 +6,7 @@
 use notetaker::audio::{self, AudioCapture, AudioLevelCallback};
 use notetaker::models::{AudioDevice, Meeting, TranscriptSegment};
 use notetaker::storage::Database;
+use notetaker::transcribe::{LocalTranscriber, TranscriptCallback};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 
@@ -13,6 +14,7 @@ pub struct CoreBridge {
     db: Arc<Database>,
     model_path: String,
     capture: Arc<Mutex<Option<AudioCapture>>>,
+    transcriber: Arc<Mutex<Option<LocalTranscriber>>>,
     current_meeting_id: Arc<Mutex<Option<i64>>>,
     audio_level: Arc<Mutex<f32>>,
     transcript_tx: Arc<Mutex<Option<async_channel::Sender<TranscriptSegment>>>>,
@@ -26,6 +28,7 @@ impl CoreBridge {
             db: Arc::new(db),
             model_path: model_path.to_owned(),
             capture: Arc::new(Mutex::new(None)),
+            transcriber: Arc::new(Mutex::new(None)),
             current_meeting_id: Arc::new(Mutex::new(None)),
             audio_level: Arc::new(Mutex::new(0.0)),
             transcript_tx: Arc::new(Mutex::new(None)),
@@ -38,10 +41,11 @@ impl CoreBridge {
     pub async fn start_recording(&self, device_id: Option<String>) -> Result<(), String> {
         let db = self.db.clone();
         let capture_slot = self.capture.clone();
+        let transcriber_slot = self.transcriber.clone();
         let meeting_slot = self.current_meeting_id.clone();
         let level = self.audio_level.clone();
         let transcript_tx = self.transcript_tx.clone();
-        let _model_path = self.model_path.clone();
+        let model_dir = self.model_path.clone();
 
         self.rt
             .spawn_blocking(move || {
@@ -50,39 +54,72 @@ impl CoreBridge {
                     .map_err(|e| e.to_string())?;
                 *meeting_slot.lock().unwrap() = Some(meeting_id);
 
-                // Audio level callback for UI metering.
-                let level_cb = level.clone();
-                let level_callback: AudioLevelCallback =
-                    Box::new(move |l| {
+                // Build the transcriber (which loads the model synchronously and
+                // can fail) before starting capture, so a missing model doesn't
+                // leave a live capture or an orphan meeting row behind.
+                let build = || -> Result<(AudioCapture, LocalTranscriber), String> {
+                    // Channel carrying resampled 16kHz mono audio from capture
+                    // into the transcriber.
+                    let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+
+                    // Forward each transcribed segment to the UI, if subscribed.
+                    let tx_slot = transcript_tx.lock().unwrap().clone();
+                    let callback: Option<TranscriptCallback> = tx_slot.map(|tx| {
+                        let cb: TranscriptCallback =
+                            Box::new(move |text: &str, timestamp_secs: f64| {
+                                let _ = tx.try_send(TranscriptSegment {
+                                    id: 0,
+                                    meeting_id,
+                                    timestamp_ms: (timestamp_secs * 1000.0).round() as i64,
+                                    text: text.to_owned(),
+                                    confidence: None,
+                                });
+                            });
+                        cb
+                    });
+
+                    // Resolve the model file from the configured model name.
+                    let model_name = db
+                        .get_setting("whisper_model")
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_else(|| "tiny".to_string());
+                    let model_file = format!("{model_dir}/ggml-{model_name}.bin");
+
+                    let transcriber = LocalTranscriber::new(
+                        &model_file,
+                        audio_rx,
+                        db.clone(),
+                        meeting_id,
+                        callback,
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                    // Audio level callback for UI metering.
+                    let level_cb = level.clone();
+                    let level_callback: AudioLevelCallback = Box::new(move |l| {
                         *level_cb.lock().unwrap() = l;
                     });
 
-                // Channel for raw audio data from the capture thread.
-                let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+                    let cap =
+                        AudioCapture::new(device_id.as_deref(), audio_tx, Some(level_callback))
+                            .map_err(|e| e.to_string())?;
+                    cap.start().map_err(|e| e.to_string())?;
 
-                let dev_id = device_id.as_deref();
-                let cap = AudioCapture::new(dev_id, audio_tx, Some(level_callback))
-                    .map_err(|e| e.to_string())?;
-                cap.start().map_err(|e| e.to_string())?;
-                *capture_slot.lock().unwrap() = Some(cap);
+                    Ok((cap, transcriber))
+                };
 
-                // Spawn a thread that reads audio chunks and produces
-                // placeholder transcript segments. Real transcription would
-                // feed audio_rx into a Whisper model; for now we just drain
-                // the channel so the audio pipeline doesn't block.
-                let tx_slot = transcript_tx.lock().unwrap().clone();
-                let db_for_seg = db.clone();
-                std::thread::spawn(move || {
-                    let mut chunk_count: i64 = 0;
-                    while let Ok(_samples) = audio_rx.recv() {
-                        chunk_count += 1;
-                        // TODO: feed samples into LocalTranscriber and emit
-                        // real segments. For now the pipeline just drains.
-                        let _ = (&tx_slot, &db_for_seg, chunk_count);
+                match build() {
+                    Ok((cap, transcriber)) => {
+                        *capture_slot.lock().unwrap() = Some(cap);
+                        *transcriber_slot.lock().unwrap() = Some(transcriber);
+                        Ok(())
                     }
-                });
-
-                Ok(())
+                    Err(e) => {
+                        *meeting_slot.lock().unwrap() = None;
+                        let _ = db.delete_meeting(meeting_id);
+                        Err(e)
+                    }
+                }
             })
             .await
             .map_err(|e| e.to_string())?
@@ -90,13 +127,28 @@ impl CoreBridge {
 
     pub async fn stop_recording(&self) -> Result<i64, String> {
         let capture_slot = self.capture.clone();
+        let transcriber_slot = self.transcriber.clone();
         let meeting_slot = self.current_meeting_id.clone();
         let db = self.db.clone();
 
         self.rt
             .spawn_blocking(move || {
+                // Stop and drop audio capture FIRST so its audio_tx sender is
+                // closed. If the transcriber were stopped first, its shutdown
+                // drain would run against a still-live capture and, when
+                // inference is slower than real-time, never empty the backlog —
+                // hanging the worker-thread join (and this stop future) forever.
                 if let Some(cap) = capture_slot.lock().unwrap().take() {
                     let _ = cap.stop();
+                }
+
+                // With the sender gone the transcriber drains the now-finite
+                // backlog, flushes a final segment, and its thread joins. Take
+                // it out of the slot before joining so the mutex isn't held
+                // across the join.
+                let transcriber = transcriber_slot.lock().unwrap().take();
+                if let Some(transcriber) = transcriber {
+                    transcriber.stop();
                 }
 
                 let meeting_id = meeting_slot
@@ -183,6 +235,14 @@ impl CoreBridge {
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("Meeting {meeting_id} not found"))
             })
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    pub async fn get_transcript(&self, meeting_id: i64) -> Result<Vec<TranscriptSegment>, String> {
+        let db = self.db.clone();
+        self.rt
+            .spawn_blocking(move || db.get_segments(meeting_id).map_err(|e| e.to_string()))
             .await
             .map_err(|e| e.to_string())?
     }
