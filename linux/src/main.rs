@@ -88,6 +88,13 @@ fn main() {
 
     let bridge_clone = bridge.clone();
     app.connect_activate(move |app| {
+        // Re-activating (e.g. after the window was hidden via hide-on-close)
+        // should re-present the existing window instead of leaking a new one.
+        let windows = app.windows();
+        if let Some(existing) = windows.first() {
+            existing.present();
+            return;
+        }
         let win = window::AppWindow::new(app, bridge_clone.clone());
         win.present();
     });

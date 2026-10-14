@@ -79,16 +79,16 @@ pub fn build(bridge: Arc<CoreBridge>) -> gtk::Box {
                     list_c.remove(&child);
                 }
 
-                match bridge_c.list_meetings(50, 0).await {
-                    Ok(meetings) => {
-                        let needle = search_text.to_lowercase();
-                        for meeting in meetings {
-                            // Client-side search filter.
-                            if !needle.is_empty() && !meeting.title.to_lowercase().contains(&needle)
-                            {
-                                continue;
-                            }
+                // Non-empty query → real FTS5 search; empty → list all.
+                let result = if search_text.trim().is_empty() {
+                    bridge_c.list_meetings(50, 0).await
+                } else {
+                    bridge_c.search_meetings(&search_text).await
+                };
 
+                match result {
+                    Ok(meetings) => {
+                        for meeting in meetings {
                             let duration_str = meeting
                                 .duration_secs
                                 .map(|s| {
