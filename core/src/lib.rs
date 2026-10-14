@@ -165,51 +165,9 @@ impl log::Log for CLogger {
 
 static LOGGER: CLogger = CLogger;
 
-/// Return the most recent error message for the calling thread, or null if none.
-///
-/// The returned string is caller-owned; free it with [`note_free_string`].
-/// Call this after an FFI function reports failure (a negative code or a null
-/// return) to get a human-readable reason.
-#[no_mangle]
-pub extern "C" fn note_last_error() -> *mut c_char {
-    catch_unwind(|| {
-        LAST_ERROR.with(|e| match e.borrow().as_ref() {
-            Some(cs) => cs.clone().into_raw(),
-            None => std::ptr::null_mut(),
-        })
-    })
-    .unwrap_or(std::ptr::null_mut())
-}
-
-/// Install a structured log callback.
-///
-/// - `cb`: `void(int level, const char* message, void* ctx)` invoked for each log
-///   record, or null to detach the current sink. The message pointer is only
-///   valid for the duration of the call. Levels: 1=error, 2=warn, 3=info,
-///   4=debug, 5=trace.
-/// - `ctx`: opaque context pointer passed through to the callback.
-///
-/// The underlying logger is installed once per process; if another logger was
-/// already installed (for example by the host app), the callback is stored but
-/// will not receive records.
-#[no_mangle]
-pub extern "C" fn note_set_log_callback(cb: Option<LogCallbackFn>, ctx: *mut c_void) {
-    let _ = catch_unwind(|| {
-        LOGGER_INIT.get_or_init(|| match log::set_logger(&LOGGER) {
-            Ok(()) => {
-                log::set_max_level(log::LevelFilter::Info);
-                true
-            }
-            Err(_) => false,
-        });
-        if let Ok(mut guard) = LOG_SINK.lock() {
-            *guard = cb.map(|f| CLogCallback {
-                cb: f,
-                ctx: CallbackCtx(ctx),
-            });
-        }
-    });
-}
+// The `note_last_error` and `note_set_log_callback` FFI entry points live at the
+// end of this file so the generated C header lists them after the rest of the
+// surface; they use the thread-local and logger infrastructure defined above.
 
 // ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -507,13 +465,45 @@ pub extern "C" fn note_pause_recording(handle: *mut NoteHandle) -> i32 {
         let guard = h.audio_capture.lock().unwrap();
         if let Some(ref capture) = *guard {
             if let Err(e) = capture.pause() {
+                set_last_error(format!("Failed to pause recording: {}", e));
                 error!("Failed to pause recording: {}", e);
                 return NOTE_ERR_INTERNAL;
             }
             info!("Recording paused");
             NOTE_OK
         } else {
+            set_last_error("No active recording to pause");
             error!("No active recording to pause");
+            NOTE_ERR_NOT_FOUND
+        }
+    }) {
+        Ok(code) => code,
+        Err(_) => NOTE_ERR_PANIC,
+    }
+}
+
+/// Resume a paused recording session.
+///
+/// Returns 0 on success, or a negative error code.
+#[no_mangle]
+pub extern "C" fn note_resume_recording(handle: *mut NoteHandle) -> i32 {
+    if handle.is_null() {
+        return NOTE_ERR_NULL_PTR;
+    }
+    match catch_unwind(|| {
+        let h = unsafe { &*handle };
+        let guard = h.audio_capture.lock().unwrap();
+        if let Some(ref capture) = *guard {
+            if let Err(e) = capture.resume() {
+                set_last_error(format!("Failed to resume recording: {}", e));
+                error!("Failed to resume recording: {}", e);
+                return NOTE_ERR_INTERNAL;
+            }
+            info!("Recording resumed");
+            NOTE_OK
+        } else {
+            set_last_error("No active recording to resume");
+            error!("No active recording to resume");
             NOTE_ERR_NOT_FOUND
         }
     }) {
@@ -739,6 +729,7 @@ pub extern "C" fn note_get_meeting(handle: *mut NoteHandle, meeting_id: i64) -> 
             },
             Ok(None) => std::ptr::null_mut(),
             Err(e) => {
+                set_last_error(format!("Failed to get meeting {}: {}", meeting_id, e));
                 error!("Failed to get meeting {}: {}", meeting_id, e);
                 std::ptr::null_mut()
             }
@@ -746,6 +737,122 @@ pub extern "C" fn note_get_meeting(handle: *mut NoteHandle, meeting_id: i64) -> 
     }) {
         Ok(ptr) => ptr,
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Get all transcript segments for a meeting as a JSON array.
+///
+/// Returns a JSON string (possibly an empty array), or null on error.
+/// Free with [`note_free_string`].
+#[no_mangle]
+pub extern "C" fn note_get_segments(handle: *mut NoteHandle, meeting_id: i64) -> *mut c_char {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    match catch_unwind(|| {
+        let h = unsafe { &*handle };
+        match h.db.get_segments(meeting_id) {
+            Ok(segments) => match serde_json::to_string(&segments) {
+                Ok(json) => string_to_cptr(json),
+                Err(e) => {
+                    set_last_error(format!("Failed to serialize segments: {}", e));
+                    error!("Failed to serialize segments: {}", e);
+                    std::ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_last_error(format!(
+                    "Failed to get segments for meeting {}: {}",
+                    meeting_id, e
+                ));
+                error!("Failed to get segments for meeting {}: {}", meeting_id, e);
+                std::ptr::null_mut()
+            }
+        }
+    }) {
+        Ok(ptr) => ptr,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Search meetings by transcript text (FTS5).
+///
+/// Returns a JSON array of the meetings whose transcripts match `query`, newest
+/// first (possibly an empty array), or null on error. Free with
+/// [`note_free_string`].
+#[no_mangle]
+pub extern "C" fn note_search_meetings(
+    handle: *mut NoteHandle,
+    query: *const c_char,
+) -> *mut c_char {
+    if handle.is_null() || query.is_null() {
+        return std::ptr::null_mut();
+    }
+    match catch_unwind(|| {
+        let h = unsafe { &*handle };
+        let q = match unsafe { cstr_to_str(query) } {
+            Some(s) => s,
+            None => {
+                set_last_error("note_search_meetings: invalid query string");
+                return std::ptr::null_mut();
+            }
+        };
+        match h.db.search_meetings_full(q) {
+            Ok(meetings) => match serde_json::to_string(&meetings) {
+                Ok(json) => string_to_cptr(json),
+                Err(e) => {
+                    set_last_error(format!("Failed to serialize search results: {}", e));
+                    error!("Failed to serialize search results: {}", e);
+                    std::ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_last_error(format!("Search failed: {}", e));
+                error!("Search failed: {}", e);
+                std::ptr::null_mut()
+            }
+        }
+    }) {
+        Ok(ptr) => ptr,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Update a meeting's title.
+///
+/// Returns 0 on success, or a negative error code.
+#[no_mangle]
+pub extern "C" fn note_update_meeting_title(
+    handle: *mut NoteHandle,
+    meeting_id: i64,
+    title: *const c_char,
+) -> i32 {
+    if handle.is_null() || title.is_null() {
+        return NOTE_ERR_NULL_PTR;
+    }
+    match catch_unwind(|| {
+        let h = unsafe { &*handle };
+        let t = match unsafe { cstr_to_str(title) } {
+            Some(s) => s,
+            None => {
+                set_last_error("note_update_meeting_title: invalid title string");
+                return NOTE_ERR_INVALID_ARG;
+            }
+        };
+        match h.db.update_meeting_title(meeting_id, t) {
+            Ok(()) => {
+                info!("Updated title for meeting {}", meeting_id);
+                NOTE_OK
+            }
+            Err(e) => {
+                set_last_error(format!("Failed to update meeting title: {}", e));
+                error!("Failed to update meeting title: {}", e);
+                NOTE_ERR_INTERNAL
+            }
+        }
+    }) {
+        Ok(code) => code,
+        Err(_) => NOTE_ERR_PANIC,
     }
 }
 
@@ -902,4 +1009,52 @@ pub extern "C" fn note_list_audio_devices(_handle: *mut NoteHandle) -> *mut c_ch
         Ok(ptr) => ptr,
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+// ── Diagnostics ──────────────────────────────────────────────────────
+
+/// Return the most recent error message for the calling thread, or null if none.
+///
+/// The returned string is caller-owned; free it with [`note_free_string`].
+/// Call this after an FFI function reports failure (a negative code or a null
+/// return) to get a human-readable reason.
+#[no_mangle]
+pub extern "C" fn note_last_error() -> *mut c_char {
+    catch_unwind(|| {
+        LAST_ERROR.with(|e| match e.borrow().as_ref() {
+            Some(cs) => cs.clone().into_raw(),
+            None => std::ptr::null_mut(),
+        })
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Install a structured log callback.
+///
+/// - `cb`: `void(int level, const char* message, void* ctx)` invoked for each log
+///   record, or null to detach the current sink. The message pointer is only
+///   valid for the duration of the call. Levels: 1=error, 2=warn, 3=info,
+///   4=debug, 5=trace.
+/// - `ctx`: opaque context pointer passed through to the callback.
+///
+/// The underlying logger is installed once per process; if another logger was
+/// already installed (for example by the host app), the callback is stored but
+/// will not receive records.
+#[no_mangle]
+pub extern "C" fn note_set_log_callback(cb: Option<LogCallbackFn>, ctx: *mut c_void) {
+    let _ = catch_unwind(|| {
+        LOGGER_INIT.get_or_init(|| match log::set_logger(&LOGGER) {
+            Ok(()) => {
+                log::set_max_level(log::LevelFilter::Info);
+                true
+            }
+            Err(_) => false,
+        });
+        if let Ok(mut guard) = LOG_SINK.lock() {
+            *guard = cb.map(|f| CLogCallback {
+                cb: f,
+                ctx: CallbackCtx(ctx),
+            });
+        }
+    });
 }

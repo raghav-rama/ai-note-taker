@@ -178,6 +178,16 @@ impl Database {
         Ok(())
     }
 
+    /// Update the title for a meeting.
+    pub fn update_meeting_title(&self, meeting_id: i64, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE meetings SET title = ?1 WHERE id = ?2",
+            params![title, meeting_id],
+        )?;
+        Ok(())
+    }
+
     /// List meetings ordered by most recent first.
     pub fn list_meetings(&self, limit: i32, offset: i32) -> Result<Vec<Meeting>> {
         let conn = self.conn.lock().unwrap();
@@ -349,6 +359,20 @@ impl Database {
             ids.push(row?);
         }
         Ok(ids)
+    }
+
+    /// Search meetings by transcript text and return the full [`Meeting`] rows,
+    /// newest first. This is what the FFI search surface returns so callers get
+    /// decodable meeting objects rather than bare ids.
+    pub fn search_meetings_full(&self, query: &str) -> Result<Vec<Meeting>> {
+        let ids = self.search_meetings(query)?;
+        let mut meetings = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(m) = self.get_meeting(id)? {
+                meetings.push(m);
+            }
+        }
+        Ok(meetings)
     }
 
     // ── Settings ──────────────────────────────────────────────────────
